@@ -1,0 +1,38 @@
+{
+  "title": "Shop API",
+  "version": "1.0.0",
+  "operations": [
+    {
+      "name": "list_items_items_get",
+      "method": "GET",
+      "path": "/items"
+    },
+    {
+      "name": "create_item_items_post",
+      "method": "POST",
+      "path": "/items"
+    },
+    {
+      "name": "get_item_items__item_id__get",
+      "method": "GET",
+      "path": "/items/{item_id}"
+    },
+    {
+      "name": "patch_item_items__item_id__patch",
+      "method": "PATCH",
+      "path": "/items/{item_id}"
+    },
+    {
+      "name": "delete_item_items__item_id__delete",
+      "method": "DELETE",
+      "path": "/items/{item_id}"
+    }
+  ],
+  "models": [
+    "HTTPValidationError",
+    "Item",
+    "ItemCreate",
+    "ItemPatch",
+    "ValidationError"
+  ]
+}
