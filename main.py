@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+"""ASGI entry point: the demo resource service plus the forge management API.
 
-app = FastAPI()
+Run locally with::
 
+    uv run uvicorn main:app --reload
+"""
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+from sdk_forge.service import app
+
+__all__ = ["app"]
