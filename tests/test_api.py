@@ -134,3 +134,75 @@ def test_replay_endpoint_rejects_malformed_contract(client):
     resp = client.post("/forge/replay", json={"old_contract": bad, "new_contract": good})
     assert resp.status_code == 422
     assert resp.json()["detail"]["code"] == "malformed_contract"
+
+
+def _ping_spec(version, required_msg):
+    return {
+        "openapi": "3.1.0", "info": {"title": "D", "version": version},
+        "paths": {"/ping": {"get": {"operationId": "ping", "tags": ["x"],
+            "responses": {"200": {"description": "ok", "content": {
+                "application/json": {"schema": {
+                    "type": "object",
+                    "required": ["msg"] if required_msg else [],
+                    "properties": {"msg": {"type": "string"}}}}}}}}}},
+    }
+
+
+def test_rules_versions_endpoint_lists_frozen_and_current(client):
+    resp = client.get("/forge/rules-versions")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["current"] == "2026.09.30"
+    assert body["versions"] == ["2026.09.01", "2026.09.30"]
+
+
+def test_compare_rules_endpoint_shows_direction_opposite_conclusions(client):
+    old = _ping_spec("1", True)
+    new = _ping_spec("2", False)  # 响应字段必填 -> 可选
+    logger.info("compare 旧契约: %s\n新契约: %s", old, new)
+    resp = client.post("/forge/compare-rules",
+                       json={"old_contract": old, "new_contract": new})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    logger.info("compare 判定依据: %s", body)
+    assert body["2026.09.01"]["compatible"] is True
+    assert body["2026.09.30"]["compatible"] is False
+    change = body["2026.09.30"]["breaking_changes"][0]
+    assert change["kind"] == "field_became_optional"
+    assert change["direction"] == "response"
+    assert change["location"].endswith("响应 200.msg")
+
+    # 不存在的规则版本：明确 404 + 可区分 code，不按当前规则静默处理
+    bad = client.post("/forge/compare-rules", json={
+        "old_contract": old, "new_contract": new,
+        "rules_versions": ["1999.01.01"],
+    })
+    assert bad.status_code == 404
+    detail = bad.json()["detail"]
+    assert detail["code"] == "unknown_rules_version"
+    assert "1999.01.01" in detail["message"]
+    assert detail["available"] == ["2026.09.01", "2026.09.30"]
+
+
+def test_checks_run_list_get_and_idempotent(client):
+    old = _ping_spec("1", True)
+    new = _ping_spec("2", True)
+    payload = {"old_contract": old, "new_contract": new,
+               "rules_version": "2026.09.30"}
+    r1 = client.post("/forge/checks", json=payload)
+    assert r1.status_code == 200, r1.text
+    r2 = client.post("/forge/checks", json=payload)
+    assert r2.status_code == 200
+    assert r1.json() == r2.json()  # 重复触发不重算、不覆盖
+
+    listing = client.get("/forge/checks").json()["checks"]
+    assert len(listing) == 1
+    rec = listing[0]
+    assert rec["old_version"] == "1" and rec["new_version"] == "2"
+    assert rec["rules_version"] == "2026.09.30"
+
+    got = client.get("/forge/checks/2/2026.09.30/1")
+    assert got.status_code == 200
+    assert got.json()["new_version"] == "2"
+    missing = client.get("/forge/checks/9/2026.09.30/1")
+    assert missing.status_code == 404

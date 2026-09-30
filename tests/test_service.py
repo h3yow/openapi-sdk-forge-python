@@ -9,13 +9,17 @@ import time
 import pytest
 
 from sdk_forge import service as service_mod
+from sdk_forge.contract import parse_contract
 from sdk_forge.errors import (
+    CheckInProgressError,
     GenerationInProgressError,
     IncompatibleContractError,
     ServiceUnreachableError,
+    UnknownRulesVersionError,
     VersionMismatchError,
 )
 from sdk_forge.service import ForgeService
+from sdk_forge.versioning import RULES_VERSION, RULES_VERSION_V1, compare_across_rules
 
 logger = logging.getLogger("service-tests")
 
@@ -191,3 +195,156 @@ def test_replay_historical_judgement(tmp_path):
     assert r1.compatible is False and r2.compatible is False
     # 复现必须逐字段一致（不盖时间戳）
     assert r1.to_dict() == r2.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# 判定归档：去重 / 不覆盖 / 并发 / 查询 / 跨规则版本
+# ---------------------------------------------------------------------------
+
+SPEC_V2_MSG_OPTIONAL = {
+    "openapi": "3.1.0",
+    "info": {"title": "Demo", "version": "2.0.0"},
+    "paths": {"/ping": {"get": {
+        "operationId": "ping", "tags": ["meta"],
+        "responses": {"200": {"description": "ok", "content": {
+            "application/json": {"schema": {"type": "object", "properties": {
+                "msg": {"type": "string"}}, "required": []}}}}}}}},
+}
+
+
+def test_run_check_is_idempotent_and_never_overwrites(tmp_path, monkeypatch):
+    svc = ForgeService()
+    logger.info("判定输入 旧契约: %s\n新契约: %s", SPEC_V1, SPEC_V2_COMPAT)
+    r1 = svc.run_check(output_dir=tmp_path, old_contract=SPEC_V1,
+                       new_contract=SPEC_V2_COMPAT)
+    path = ForgeService._check_path(tmp_path, "1.0.0", "2.0.0", RULES_VERSION)
+    assert path.exists()
+    first_bytes = path.read_bytes()
+    logger.info("判定依据: %s", r1.to_dict())
+
+    # 第二次触发：判定函数若再被调用即失败——证明不重复计算
+    def boom(*a, **k):
+        raise AssertionError("不应重新计算已完成的判定")
+    monkeypatch.setattr(service_mod, "check_with_rules", boom)
+    r2 = svc.run_check(output_dir=tmp_path, old_contract=SPEC_V1,
+                       new_contract=SPEC_V2_COMPAT)
+    assert r2.to_dict() == r1.to_dict()
+    assert path.read_bytes() == first_bytes  # 已跑完的结论不被覆盖
+
+
+def test_run_check_concurrent_trigger_is_rejected_or_reused(tmp_path, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    real_check = service_mod.check_with_rules
+
+    def slow_check(old_ir, new_ir, rules_version):
+        entered.set()
+        release.wait(timeout=5)
+        return real_check(old_ir, new_ir, rules_version)
+
+    monkeypatch.setattr(service_mod, "check_with_rules", slow_check)
+    svc = ForgeService()
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            svc.run_check(output_dir=tmp_path, old_contract=SPEC_V1,
+                          new_contract=SPEC_V2_COMPAT)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert entered.wait(2)
+    # 进行中：并发同组合必须被明确告知，不能串结果/写半成品
+    with pytest.raises(CheckInProgressError):
+        svc.run_check(output_dir=tmp_path, old_contract=SPEC_V1,
+                      new_contract=SPEC_V2_COMPAT)
+    release.set()
+    t.join()
+    assert errors == []
+
+    # 完成后再次触发直接复用（判定函数仍被 patch 为阻塞版本也不会再进入）
+    release.set()
+    got = svc.run_check(output_dir=tmp_path, old_contract=SPEC_V1,
+                        new_contract=SPEC_V2_COMPAT)
+    assert got.compatible is True
+    leftovers = [
+        p.name for p in tmp_path.rglob("*")
+        if p.is_dir() and p.name.startswith(".")
+    ]
+    assert leftovers == []
+
+
+def test_archived_checks_are_queryable_and_listable(tmp_path):
+    svc = ForgeService()
+    svc.run_check(output_dir=tmp_path, old_contract=SPEC_V1,
+                  new_contract=SPEC_V2_BREAKING, rules_version=RULES_VERSION)
+
+    fetched = svc.get_check(
+        tmp_path, old_version="1.0.0", new_version="2.0.0",
+        rules_version=RULES_VERSION,
+    )
+    assert fetched is not None and fetched.compatible is False
+    assert fetched.old_version == "1.0.0" and fetched.new_version == "2.0.0"
+    assert svc.get_check(
+        tmp_path, old_version="9.9.9", new_version="2.0.0",
+        rules_version=RULES_VERSION,
+    ) is None
+
+    records = svc.list_checks(tmp_path)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["old_version"] == "1.0.0"
+    assert rec["new_version"] == "2.0.0"
+    assert rec["rules_version"] == RULES_VERSION
+    assert rec["compatible"] is False
+
+
+def test_same_evolution_archived_under_both_rules_versions(tmp_path):
+    """同一份演进分别按两套规则归档，结论各自可查、互不串写。"""
+    svc = ForgeService()
+    for version in (RULES_VERSION_V1, RULES_VERSION):
+        report = svc.run_check(
+            output_dir=tmp_path, old_contract=SPEC_V1,
+            new_contract=SPEC_V2_MSG_OPTIONAL, rules_version=version,
+        )
+        logger.info("规则 %s 判定依据: %s", version, report.to_dict())
+
+    old_report = svc.get_check(
+        tmp_path, old_version="1.0.0", new_version="2.0.0",
+        rules_version=RULES_VERSION_V1,
+    )
+    new_report = svc.get_check(
+        tmp_path, old_version="1.0.0", new_version="2.0.0",
+        rules_version=RULES_VERSION,
+    )
+    # 必填响应字段 -> 可选：旧规则接受，新规则判破坏并定位接口与字段
+    assert old_report.compatible is True
+    assert new_report.compatible is False
+    hit = new_report.breaking_changes[0]
+    assert hit.kind == "field_became_optional"
+    assert hit.direction == "response"
+    assert "GET /ping -> 响应 200.msg" == hit.location
+
+    records = svc.list_checks(tmp_path)
+    assert [(r["rules_version"], r["compatible"]) for r in records] == [
+        (RULES_VERSION_V1, True),
+        (RULES_VERSION, False),
+    ]
+    # 与纯复现接口逐字段一致
+    replay = compare_across_rules(
+        parse_contract(SPEC_V1), parse_contract(SPEC_V2_MSG_OPTIONAL)
+    )
+    assert replay[RULES_VERSION_V1].to_dict() == old_report.to_dict()
+    assert replay[RULES_VERSION].to_dict() == new_report.to_dict()
+
+
+def test_run_check_unknown_rules_version_is_distinct(tmp_path):
+    svc = ForgeService()
+    with pytest.raises(UnknownRulesVersionError) as exc:
+        svc.run_check(output_dir=tmp_path, old_contract=SPEC_V1,
+                      new_contract=SPEC_V2_COMPAT, rules_version="1900.01.01")
+    assert exc.value.rules_version == "1900.01.01"
+    assert svc.list_checks(tmp_path) == []  # 失败不留半成品记录

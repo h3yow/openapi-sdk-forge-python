@@ -1,13 +1,27 @@
-"""契约版本提取与向后兼容性判定。
+"""契约版本提取与按数据方向分离的向后兼容性判定。
 
-判定规则由 :data:`RULES_VERSION` 标识；规则演进时提升版本号，历史判定
-可凭归档契约与 rules_version 复现（见 :func:`replay_report`）。
+判定规则由 :data:`RULES_VERSION` 标识；规则演进时提升版本号并在
+:data:`RULESETS` 注册表中保留旧版本实现，历史判定可凭归档契约与
+``rules_version`` 字节级复现（见 :func:`check_with_rules` /
+:func:`compare_across_rules`）。
 
-兼容性规则摘要（consumer 视角，旧客户端 + 新服务）：
+数据方向（consumer = 旧客户端 + 新服务 视角）：
 
-* 新增接口 / 新增可选请求参数 / 请求体新增可选字段 / 新增可选响应状态：接受
-* 响应新增可选字段、枚举新增取值、类型放宽（int -> float）：接受
-* 删除接口 / 参数 / 字段 / 响应状态、必填化、类型收窄、枚举收窄：拒绝
+* **请求方向**（参数 / 请求体，客户端 -> 服务端）：
+  新增必填参数或字段、删除参数或字段、类型/枚举收窄都判破坏。
+* **响应方向**（响应状态 / 响应字段，服务端 -> 客户端）：
+  字段必填 -> 可选判破坏（服务端可能不再返回，老客户端读到缺失数据）；
+  字段可选 -> 必填接受（服务端给出更强保证）；删除响应字段、类型/枚举
+  收窄仍判破坏。
+
+规则集版本：
+
+* ``2026.09.01``（已冻结）：方向不敏感的早期规则——字段/参数必填变可选
+  一律接受，新增必填字段仅在**请求体顶层**判破坏。保留该实现用于复现
+  历史结论，永不改动。
+* ``2026.09.30``（当前 :data:`RULES_VERSION`）：请求/响应方向分别判定；
+  请求体任意深度的新增必填字段都判破坏；响应必填字段变可选判破坏
+  （新 kind：``field_became_optional``），可选变必填接受。
 """
 
 from __future__ import annotations
@@ -15,14 +29,22 @@ from __future__ import annotations
 import datetime
 from typing import Any
 
+from .errors import UnknownRulesVersionError
 from .models import (
     BreakingChange,
     CompatibilityReport,
     ContractIR,
 )
 
-# 当前规则集版本。规则发生变化时必须提升（保留旧版本函数用于复现历史判定）。
-RULES_VERSION = "2026.09.01"
+# 历史规则版本（已冻结，禁止改动其判定逻辑）。
+RULES_VERSION_V1 = "2026.09.01"
+# 当前规则集版本。规则发生变化时必须提升并在此注册新版本。
+RULES_VERSION = "2026.09.30"
+
+# 数据方向标识（写入每条 BreakingChange）。
+DIRECTION_REQUEST = "request"
+DIRECTION_RESPONSE = "response"
+DIRECTION_ENDPOINT = "endpoint"
 
 # 类型放宽关系：old -> 允许的 new 集合（consumer 收到更宽的值安全）
 _WIDENINGS: dict[str, set[str]] = {
@@ -97,10 +119,57 @@ def _union_types(n: dict) -> list[str]:
 
 
 class _RuleSet:
-    """单个规则版本的全部判定逻辑。"""
+    """单个规则版本的全部判定逻辑（基类 = 当前规则，按方向分别判定）。
 
-    def __init__(self, version: str) -> None:
-        self.version = version
+    子类通过覆写三个方向钩子表达版本差异；冻结版本（见
+    :class:`_FrozenRulesV1`）覆写后不得再改，以保证历史结论可复现。
+    """
+
+    version: str = RULES_VERSION
+
+    def __init__(self, version: str | None = None) -> None:
+        if version is not None:
+            self.version = version
+
+    # -- 方向钩子（新版本语义；冻结版本在子类中覆写） -------------------------
+
+    def required_to_optional(
+        self, direction: str, depth: int, *, subject: str, name: str
+    ) -> tuple[str, str] | None:
+        """必填 -> 可选。返回 (kind, detail) 表示破坏；None 表示接受。"""
+        if direction == DIRECTION_RESPONSE:
+            return (
+                "field_became_optional",
+                (
+                    f"{subject}由必填变为可选：服务端可能不再返回该字段，"
+                    "老客户端会读到缺失数据"
+                ),
+            )
+        # 请求方向：客户端不再被强制发送，属于放宽
+        return None
+
+    def optional_to_required(
+        self, direction: str, depth: int, *, subject: str, name: str
+    ) -> tuple[str, str] | None:
+        """可选 -> 必填。返回 (kind, detail) 表示破坏；None 表示接受。"""
+        if direction == DIRECTION_REQUEST:
+            return (
+                "required_added",
+                f"{subject} 由可选变为必填，旧客户端不会提供该值",
+            )
+        # 响应方向：服务端给出更强保证，接受
+        return None
+
+    def new_required_field(
+        self, direction: str, depth: int, *, subject: str, name: str
+    ) -> tuple[str, str] | None:
+        """新增的字段在新契约中标记为必填。返回破坏描述或 None。"""
+        if direction == DIRECTION_REQUEST:
+            return (
+                "required_added",
+                f"新增了必填字段 {name!r}，旧客户端不会提供该值",
+            )
+        return None
 
     # -- schema 级 -----------------------------------------------------------
 
@@ -112,11 +181,21 @@ class _RuleSet:
         spec_new: dict,
         location: str,
         accepted: list[str],
+        *,
+        direction: str = DIRECTION_REQUEST,
+        depth: int = 0,
     ) -> list[BreakingChange]:
-        """比较两处 schema（位置语义由 location 给出），返回破坏性变更。"""
+        """比较两处 schema（位置语义由 location/direction 给出）。
+
+        ``depth`` 为相对操作根 schema 的对象嵌套深度（参数/请求体/响应体
+        根为 0，数组元素不增加深度），供冻结版本区分"顶层 vs 嵌套"语义。
+        """
         o = _normalize(old_raw, spec_old)
         n = _normalize(new_raw, spec_new)
-        return self._diff_normalized(o, n, spec_old, spec_new, location, accepted)
+        return self._diff_normalized(
+            o, n, spec_old, spec_new, location, accepted,
+            direction=direction, depth=depth,
+        )
 
     def _diff_normalized(
         self,
@@ -126,6 +205,9 @@ class _RuleSet:
         spec_new: dict,
         location: str,
         accepted: list[str],
+        *,
+        direction: str,
+        depth: int,
     ) -> list[BreakingChange]:
         changes: list[BreakingChange] = []
 
@@ -134,7 +216,10 @@ class _RuleSet:
         # union
         if ot == "union" or nt == "union":
             changes.extend(
-                self._diff_union(o, n, spec_old, spec_new, location, accepted)
+                self._diff_union(
+                    o, n, spec_old, spec_new, location, accepted,
+                    direction=direction,
+                )
             )
             return changes
 
@@ -143,7 +228,7 @@ class _RuleSet:
             # 旧契约无约束 -> 新契约束窄为具体类型：破坏
             changes.append(BreakingChange(
                 location, "type_narrowed",
-                f"类型由无约束收窄为 {nt!r}",
+                f"类型由无约束收窄为 {nt!r}", direction,
             ))
             return changes
         if ot is not None and nt is None:
@@ -152,11 +237,13 @@ class _RuleSet:
         if ot is None and nt is None:
             return changes
 
-        # nullability：旧可选 -> 新非空 是收窄（适用于字段/参数位置的联合判断）
+        # nullability：旧可选 -> 新非空 是收窄（两个方向均破坏：
+        # 请求侧旧客户端可能发 null；响应侧旧客户端已按可空处理数据）
         if o.get("x_nullable") and not n.get("x_nullable"):
             changes.append(BreakingChange(
                 location, "type_narrowed",
                 "由可空(nullable)变为非空，旧客户端可能收到/发送 null",
+                direction,
             ))
         elif not o.get("x_nullable") and n.get("x_nullable"):
             accepted.append(f"{location}: 变为可空(nullable)，属于放宽")
@@ -171,6 +258,7 @@ class _RuleSet:
                     location, "type_narrowed",
                     f"类型由 {ot!r} 变更为 {nt!r}，不属于允许的放宽 "
                     f"({sorted(allowed) or '无'})",
+                    direction,
                 ))
             return changes
 
@@ -182,11 +270,12 @@ class _RuleSet:
                 changes.append(BreakingChange(
                     location, "type_narrowed",
                     f"string format 由 {of!r} 变更为 {nf!r}，不属于允许的放宽",
+                    direction,
                 ))
             elif nf != of:
                 accepted.append(f"{location}: format 由 {of!r} 放宽为 {nf!r}")
 
-        # 枚举：新值必须是旧值超集
+        # 枚举：新值必须是旧值超集（两个方向同理：取值集合不得缩小）
         oe = o.get("enum")
         ne = n.get("enum")
         if oe is not None or ne is not None:
@@ -198,6 +287,7 @@ class _RuleSet:
                 changes.append(BreakingChange(
                     location, "enum_narrowed",
                     f"枚举删除了取值 {removed}（旧: {old_vals}, 新: {new_vals}）",
+                    direction,
                 ))
             if added and not removed:
                 accepted.append(f"{location}: 枚举新增取值 {added}")
@@ -205,10 +295,11 @@ class _RuleSet:
         # 对象字段
         if nt == "object" and ("properties" in o or "properties" in n):
             changes.extend(
-                self._diff_object(o, n, spec_old, spec_new, location, accepted)
+                self._diff_object(o, n, spec_old, spec_new, location, accepted,
+                                  direction=direction, depth=depth)
             )
 
-        # 数组元素
+        # 数组元素（数组本身不增加对象嵌套深度）
         if nt == "array":
             oi, ni = o.get("items"), n.get("items")
             if oi is not None and ni is not None:
@@ -216,6 +307,7 @@ class _RuleSet:
                     self.diff_schemas(
                         oi, ni, spec_old, spec_new,
                         f"{location}[]", accepted,
+                        direction=direction, depth=depth,
                     )
                 )
 
@@ -229,6 +321,7 @@ class _RuleSet:
                     self.diff_schemas(
                         old_ap, n["additionalProperties"], spec_old, spec_new,
                         f"{location}.<value>", accepted,
+                        direction=direction, depth=depth,
                     )
                 )
 
@@ -242,6 +335,8 @@ class _RuleSet:
         spec_new: dict,
         location: str,
         accepted: list[str],
+        *,
+        direction: str = DIRECTION_REQUEST,
     ) -> list[BreakingChange]:
         changes: list[BreakingChange] = []
         if _type_of(o) != "union" or _type_of(n) != "union":
@@ -253,6 +348,7 @@ class _RuleSet:
             changes.append(BreakingChange(
                 location, "type_narrowed",
                 f"联合类型结构不兼容: {_type_of(o)!r} -> {_type_of(n)!r}",
+                direction,
             ))
             return changes
         old_members = {m.get("type"): m for m in o.get("x_union", [])}
@@ -262,7 +358,7 @@ class _RuleSet:
         if removed:
             changes.append(BreakingChange(
                 location, "enum_narrowed",
-                f"联合类型删除了成员 {sorted(removed)}",
+                f"联合类型删除了成员 {sorted(removed)}", direction,
             ))
         if added:
             accepted.append(f"{location}: 联合类型新增成员 {sorted(added)}")
@@ -276,6 +372,9 @@ class _RuleSet:
         spec_new: dict,
         location: str,
         accepted: list[str],
+        *,
+        direction: str,
+        depth: int,
     ) -> list[BreakingChange]:
         changes: list[BreakingChange] = []
         old_props = o.get("properties", {})
@@ -287,35 +386,52 @@ class _RuleSet:
             floc = f"{location}.{fname}"
             if fname not in new_props:
                 changes.append(BreakingChange(
-                    floc, "field_removed", f"字段 {fname!r} 被删除",
+                    floc, "field_removed", f"字段 {fname!r} 被删除", direction,
                 ))
                 continue
-            # 必填化是破坏；去必填是放宽
+            # 必填约束翻转：语义随方向/规则版本变化
             if fname in old_required and fname not in new_required:
-                accepted.append(f"{floc}: 字段由必填变为可选")
+                hit = self.required_to_optional(
+                    direction, depth, subject="字段", name=fname
+                )
+                if hit is None:
+                    accepted.append(f"{floc}: 字段由必填变为可选")
+                else:
+                    kind, detail = hit
+                    changes.append(BreakingChange(floc, kind, detail, direction))
             elif fname not in old_required and fname in new_required:
-                changes.append(BreakingChange(
-                    floc, "required_added",
-                    f"字段 {fname!r} 由可选变为必填",
-                ))
+                hit = self.optional_to_required(
+                    direction, depth, subject="字段", name=fname
+                )
+                if hit is None:
+                    accepted.append(f"{floc}: 字段由可选变为必填")
+                else:
+                    kind, detail = hit
+                    changes.append(BreakingChange(floc, kind, detail, direction))
             changes.extend(
                 self.diff_schemas(
                     old_props[fname], new_props[fname],
                     spec_old, spec_new, floc, accepted,
+                    direction=direction, depth=depth + 1,
                 )
             )
 
         for fname in new_props:
             if fname not in old_props:
+                floc = f"{location}.{fname}"
                 if fname in new_required:
-                    # 请求方向的必填新增在调用处另行处理；响应方向这不算破坏，
-                    # 这里统一登记，由调用方按方向决定语义。
-                    accepted.append(
-                        f"{location}.{fname}: 新增字段（必填，"
-                        f"在请求方向将按 required_added 处理）"
+                    hit = self.new_required_field(
+                        direction, depth, subject="字段", name=fname
                     )
+                    if hit is None:
+                        accepted.append(f"{floc}: 新增必填字段 {fname!r}")
+                    else:
+                        kind, detail = hit
+                        changes.append(
+                            BreakingChange(floc, kind, detail, direction)
+                        )
                 else:
-                    accepted.append(f"{location}.{fname}: 新增可选字段 {fname!r}")
+                    accepted.append(f"{floc}: 新增可选字段 {fname!r}")
         return changes
 
     # -- operation 级 --------------------------------------------------------
@@ -334,6 +450,7 @@ class _RuleSet:
             if key not in new_ops:
                 breaking.append(BreakingChange(
                     loc, "endpoint_removed", f"接口 {key} 被删除",
+                    DIRECTION_ENDPOINT,
                 ))
                 continue
             breaking.extend(
@@ -345,6 +462,11 @@ class _RuleSet:
         for key in new_ops:
             if key not in old_ops:
                 accepted.append(f"{key}: 新增接口")
+
+        # 稳定排序：结论顺序只取决于 (接口, 位置, 类别, 依据)，与
+        # dict 迭代顺序/执行顺序无关，保证逐字节复现。
+        breaking.sort(key=lambda c: (c.location, c.kind, c.direction, c.detail))
+        accepted.sort()
 
         compatible = not breaking
         return CompatibilityReport(
@@ -372,7 +494,7 @@ class _RuleSet:
         changes: list[BreakingChange] = []
         loc = old_op.key
 
-        # 参数：按 (in, name) 匹配
+        # 参数（请求方向）：按 (in, name) 匹配
         old_params = {(p.location, p.name): p for p in old_op.parameters}
         new_params = {(p.location, p.name): p for p in new_op.parameters}
         for (where, pname), p in old_params.items():
@@ -380,61 +502,76 @@ class _RuleSet:
             if (where, pname) not in new_params:
                 changes.append(BreakingChange(
                     ploc, "parameter_removed",
-                    f"{where} 参数 {pname!r} 被删除",
+                    f"{where} 参数 {pname!r} 被删除", DIRECTION_REQUEST,
                 ))
                 continue
             np = new_params[(where, pname)]
-            # 请求方向：可选 -> 必填 破坏；必填 -> 可选 接受
-            if not p.required and np.required:
-                changes.append(BreakingChange(
-                    ploc, "required_added",
-                    f"{where} 参数 {pname!r} 由可选变为必填",
-                ))
-            elif p.required and not np.required:
-                accepted.append(f"{ploc}: 由必填变为可选")
+            if p.required and not np.required:
+                hit = self.required_to_optional(
+                    DIRECTION_REQUEST, 0, subject=f"{where}参数", name=pname
+                )
+                if hit is None:
+                    accepted.append(f"{ploc}: 由必填变为可选")
+                else:
+                    kind, detail = hit
+                    changes.append(
+                        BreakingChange(ploc, kind, detail, DIRECTION_REQUEST)
+                    )
+            elif not p.required and np.required:
+                hit = self.optional_to_required(
+                    DIRECTION_REQUEST, 0, subject=f"{where} 参数", name=pname
+                )
+                if hit is None:
+                    accepted.append(f"{ploc}: 由可选变为必填")
+                else:
+                    kind, detail = hit
+                    changes.append(
+                        BreakingChange(ploc, kind, detail, DIRECTION_REQUEST)
+                    )
             changes.extend(
                 self.diff_schemas(
                     p.schema_raw, np.schema_raw,
                     spec_old, spec_new, ploc, accepted,
+                    direction=DIRECTION_REQUEST,
                 )
             )
         for key in new_params:
             if key not in old_params:
                 where, pname = key
+                ploc = f"{loc} -> {where} 参数 '{pname}'"
                 if new_params[key].required:
                     changes.append(BreakingChange(
-                        f"{loc} -> {where} 参数 '{pname}'",
-                        "required_added",
-                        f"新增了必填 {where} 参数 {pname!r}",
+                        ploc, "required_added",
+                        f"新增了必填 {where} 参数 {pname!r}", DIRECTION_REQUEST,
                     ))
                 else:
-                    accepted.append(
-                        f"{loc} -> {where} 参数 '{pname}': 新增可选参数"
-                    )
+                    accepted.append(f"{ploc}: 新增可选参数")
 
-        # 请求体（consumer 发送方向：收窄/必填化破坏）
+        # 请求体（请求方向）
         if old_op.body is not None or new_op.body is not None:
             bloc = f"{loc} -> 请求体"
             if old_op.body is None and new_op.body is not None:
                 if new_op.body.required:
                     changes.append(BreakingChange(
                         bloc, "required_added", "新增了必填请求体",
+                        DIRECTION_REQUEST,
                     ))
                 else:
                     accepted.append(f"{bloc}: 新增可选请求体")
             elif old_op.body is not None and new_op.body is None:
                 changes.append(BreakingChange(
-                    bloc, "body_removed", "请求体被删除",
+                    bloc, "body_removed", "请求体被删除", DIRECTION_REQUEST,
                 ))
             else:
                 ob, nb = old_op.body, new_op.body
-                if not ob.required and nb.required:
+                # 请求体本身的必填翻转：两个规则版本结论一致（请求方向）
+                if ob.required and not nb.required:
+                    accepted.append(f"{bloc}: 请求体由必填变为可选")
+                elif not ob.required and nb.required:
                     changes.append(BreakingChange(
                         bloc, "required_added", "请求体由可选变为必填",
+                        DIRECTION_REQUEST,
                     ))
-                elif ob.required and not nb.required:
-                    accepted.append(f"{bloc}: 请求体由必填变为可选")
-                # 请求方向：新增必填字段 = 破坏；删除字段 = 破坏
                 changes.extend(
                     self._diff_request_body(
                         ob.schema_raw, nb.schema_raw,
@@ -442,7 +579,7 @@ class _RuleSet:
                     )
                 )
 
-        # 响应（consumer 接收方向：状态/字段删除破坏）
+        # 响应（响应方向）：状态/字段删除、必填->可选、类型收窄均破坏
         old_resp = {r.status: r for r in old_op.responses}
         new_resp = {r.status: r for r in new_op.responses}
         for status, r in old_resp.items():
@@ -450,7 +587,7 @@ class _RuleSet:
             if status not in new_resp:
                 changes.append(BreakingChange(
                     rloc, "response_removed",
-                    f"响应状态 {status} 被删除",
+                    f"响应状态 {status} 被删除", DIRECTION_RESPONSE,
                 ))
                 continue
             nr = new_resp[status]
@@ -459,12 +596,13 @@ class _RuleSet:
                     self.diff_schemas(
                         r.schema_raw, nr.schema_raw,
                         spec_old, spec_new, rloc, accepted,
+                        direction=DIRECTION_RESPONSE,
                     )
                 )
             elif r.schema_raw and not nr.schema_raw:
                 changes.append(BreakingChange(
                     rloc, "response_removed",
-                    f"响应 {status} 的响应体 schema 被删除",
+                    f"响应 {status} 的响应体 schema 被删除", DIRECTION_RESPONSE,
                 ))
         for status in new_resp:
             if status not in old_resp:
@@ -481,48 +619,92 @@ class _RuleSet:
         location: str,
         accepted: list[str],
     ) -> list[BreakingChange]:
-        """请求方向：先收集方向特异规则（新增必填字段），再跑一次通用规则。
+        """请求方向的对象 schema 比较。
 
-        通用规则（删字段、类型收窄、可选->必填 等）只执行一次，避免双重计数。
+        通用规则（删字段、必填翻转、类型与枚举收窄、新增必填字段）全部由
+        :meth:`diff_schemas` 配合方向钩子执行一次，避免双重计数。
         """
-        o = _normalize(old_raw, spec_old)
-        n = _normalize(new_raw, spec_new)
-        direction_changes: list[BreakingChange] = []
-        if o.get("type") == "object" and n.get("type") == "object":
-            old_props = o.get("properties", {})
-            new_required = set(n.get("required", []))
-            for fname in n.get("properties", {}):
-                if fname not in old_props and fname in new_required:
-                    direction_changes.append(BreakingChange(
-                        f"{location}.{fname}", "required_added",
-                        f"请求体新增必填字段 {fname!r}",
-                    ))
-        # 通用规则（含字段删除/必填化/类型与枚举收窄），只跑一次
-        generic = self.diff_schemas(
-            old_raw, new_raw, spec_old, spec_new, location, accepted
+        return self.diff_schemas(
+            old_raw, new_raw, spec_old, spec_new, location, accepted,
+            direction=DIRECTION_REQUEST,
         )
-        return direction_changes + generic
 
 
-# 规则注册表：复现历史判定时按版本取用
-_RULESETS: dict[str, _RuleSet] = {
+class _FrozenRulesV1(_RuleSet):
+    """冻结的 2026.09.01 规则：方向不敏感的早期语义。
+
+    * 字段/参数必填 -> 可选：两个方向都接受；
+    * 字段可选 -> 必填：仅请求方向破坏（参数级在 operation 比较中另行处理）；
+    * 新增必填字段：只有**请求体顶层对象**判破坏，嵌套对象中一律接受
+      （保持与冻结时 ``_diff_request_body`` 的历史行为一致）。
+    """
+
+    version = RULES_VERSION_V1
+
+    def required_to_optional(self, direction: str, depth: int, *, subject: str, name: str):
+        return None  # 必填 -> 可选，历史上一律接受
+
+    def optional_to_required(self, direction: str, depth: int, *, subject: str, name: str):
+        if direction == DIRECTION_REQUEST:
+            return ("required_added", f"{subject} {name!r} 由可选变为必填")
+        return None
+
+    def new_required_field(self, direction: str, depth: int, *, subject: str, name: str):
+        if direction == DIRECTION_REQUEST and depth == 0:
+            return (
+                "required_added",
+                f"请求体新增必填字段 {name!r}",
+            )
+        return None
+
+
+# 规则注册表：复现历史判定时按版本取用；冻结版本登记后不得修改其实现。
+RULESETS: dict[str, _RuleSet] = {
+    RULES_VERSION_V1: _FrozenRulesV1(),
     RULES_VERSION: _RuleSet(RULES_VERSION),
 }
+
+
+def available_rules_versions() -> list[str]:
+    """返回全部已注册规则版本（旧 -> 新）。"""
+    return sorted(RULESETS)
+
+
+def _get_ruleset(rules_version: str) -> _RuleSet:
+    if rules_version not in RULESETS:
+        raise UnknownRulesVersionError(
+            rules_version, sorted(RULESETS)
+        )
+    return RULESETS[rules_version]
 
 
 def check_backward_compatible(
     old: ContractIR, new: ContractIR
 ) -> CompatibilityReport:
     """按当前 :data:`RULES_VERSION` 判定 new 是否向后兼容 old。"""
-    return _RULESETS[RULES_VERSION].check(old, new)
+    return RULESETS[RULES_VERSION].check(old, new)
 
 
 def check_with_rules(
     old: ContractIR, new: ContractIR, rules_version: str
 ) -> CompatibilityReport:
-    """按指定历史规则版本判定（复现历史结论，不带时间戳）。"""
-    if rules_version not in _RULESETS:
-        raise ValueError(
-            f"未知的规则版本 {rules_version!r}，可用: {sorted(_RULESETS)}"
-        )
-    return _RULESETS[rules_version].check(old, new, stamp_time=False)
+    """按指定（含历史冻结）规则版本判定（复现历史结论，不带时间戳）。
+
+    规则版本不存在时抛 :class:`UnknownRulesVersionError`（同时是
+    :class:`ValueError`），绝不静默回退到当前规则。
+    """
+    return _get_ruleset(rules_version).check(old, new, stamp_time=False)
+
+
+def compare_across_rules(
+    old: ContractIR,
+    new: ContractIR,
+    rules_versions: list[str] | None = None,
+) -> dict[str, CompatibilityReport]:
+    """一次跑出同一份契约演进在多个规则版本下的结论（规则升级影响面评估）。
+
+    :return: ``{rules_version: CompatibilityReport}``，均不带时间戳，
+        可逐字段比较；任一版本未注册即抛 :class:`UnknownRulesVersionError`。
+    """
+    versions = rules_versions or available_rules_versions()
+    return {v: check_with_rules(old, new, v) for v in versions}

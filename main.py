@@ -12,8 +12,16 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from sdk_forge.contract import parse_contract
 from sdk_forge.errors import ForgeError
 from sdk_forge.service import ForgeService
+from sdk_forge.versioning import (
+    RULES_VERSION as CURRENT_RULES,
+)
+from sdk_forge.versioning import (
+    available_rules_versions,
+    compare_across_rules,
+)
 
 # ---------------------------------------------------------------------------
 # 业务模型与接口（构成被生成的契约）
@@ -45,9 +53,23 @@ class GenerateRequest(BaseModel):
     timeout: float = 5.0
     # 默认只为业务接口生成 SDK；显式传 null 表示纳入全部 tag
     include_tags: list[str] | None = ["items"]
+    # 兼容性判定使用的规则版本（默认当前规则）
+    rules_version: str | None = None
 
 
 class ReplayRequest(BaseModel):
+    old_contract: dict
+    new_contract: dict
+    rules_version: str | None = None
+
+
+class CompareRequest(BaseModel):
+    old_contract: dict
+    new_contract: dict
+    rules_versions: list[str] | None = None
+
+
+class RunCheckRequest(BaseModel):
     old_contract: dict
     new_contract: dict
     rules_version: str | None = None
@@ -104,13 +126,18 @@ def create_app(artifact_root: Path | str | None = None) -> FastAPI:
     ).parent / "artifacts"
 
     def _raise_for_forge_error(exc: ForgeError) -> None:
+        extra: dict = {}
+        if hasattr(exc, "fragment"):
+            extra["fragment"] = exc.fragment  # type: ignore[attr-defined]
+        if hasattr(exc, "breaking_changes"):
+            extra["breaking_changes"] = exc.breaking_changes  # type: ignore[attr-defined]
+        if hasattr(exc, "available"):
+            extra["available"] = exc.available  # type: ignore[attr-defined]
+        if hasattr(exc, "check_key"):
+            extra["check_key"] = exc.check_key  # type: ignore[attr-defined]
         raise HTTPException(
             status_code=exc.http_status,
-            detail={"code": exc.code, "message": str(exc),
-                    **({"fragment": exc.fragment}  # type: ignore[attr-defined]
-                       if hasattr(exc, "fragment") else {}),
-                       **({"breaking_changes": exc.breaking_changes}  # type: ignore[attr-defined]
-                          if hasattr(exc, "breaking_changes") else {})},
+            detail={"code": exc.code, "message": str(exc), **extra},
         ) from exc
 
     @app.post("/forge/generate", tags=["forge"])
@@ -143,10 +170,14 @@ def create_app(artifact_root: Path | str | None = None) -> FastAPI:
     def check_compatibility_endpoint(req: GenerateRequest, request: Request):
         """拉取运行时契约，与已归档的上一版契约做兼容性判定。"""
         try:
+            kwargs = {}
+            if req.rules_version:
+                kwargs["rules_version"] = req.rules_version
             report = forge.check_compatibility(
                 req.base_url or str(request.base_url).rstrip("/"),
                 artifact_root,
                 timeout=req.timeout,
+                **kwargs,
             )
             return report.to_dict()
         except ForgeError as exc:
@@ -154,7 +185,7 @@ def create_app(artifact_root: Path | str | None = None) -> FastAPI:
 
     @app.post("/forge/replay", tags=["forge"])
     def replay_endpoint(req: ReplayRequest):
-        """用提交的两份契约（及规则版本）复现历史判定。"""
+        """用提交的两份契约（及规则版本）复现历史判定（不落盘）。"""
         try:
             report = forge.replay(
                 old_contract=req.old_contract,
@@ -163,8 +194,60 @@ def create_app(artifact_root: Path | str | None = None) -> FastAPI:
             )
         except ForgeError as exc:
             _raise_for_forge_error(exc)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return report.to_dict()
+
+    @app.post("/forge/compare-rules", tags=["forge"])
+    def compare_rules_endpoint(req: CompareRequest):
+        """同一份契约演进在多个（默认全部）规则版本下分别判成什么。"""
+        try:
+            results = compare_across_rules(
+                parse_contract(req.old_contract),
+                parse_contract(req.new_contract),
+                req.rules_versions,
+            )
+        except ForgeError as exc:
+            _raise_for_forge_error(exc)
+        return {version: report.to_dict() for version, report in results.items()}
+
+    @app.get("/forge/rules-versions", tags=["forge"])
+    def rules_versions_endpoint():
+        """列出全部已冻结/当前的规则版本。"""
+        return {"current": CURRENT_RULES,
+                "versions": available_rules_versions()}
+
+    @app.post("/forge/checks", tags=["forge"])
+    def run_check_endpoint(req: RunCheckRequest):
+        """对提交的两份契约执行判定并归档（重复触发复用、不覆盖）。"""
+        try:
+            report = forge.run_check(
+                output_dir=artifact_root,
+                old_contract=req.old_contract,
+                new_contract=req.new_contract,
+                rules_version=req.rules_version or CURRENT_RULES,
+            )
+        except ForgeError as exc:
+            _raise_for_forge_error(exc)
+        return report.to_dict()
+
+    @app.get("/forge/checks", tags=["forge"])
+    def list_checks_endpoint():
+        """列出全部已归档判定记录。"""
+        return {"checks": forge.list_checks(artifact_root)}
+
+    @app.get(
+        "/forge/checks/{new_version}/{rules_version}/{old_version}",
+        tags=["forge"],
+    )
+    def get_check_endpoint(new_version: str, rules_version: str, old_version: str):
+        """按 新契约版本 + 规则版本 + 旧契约版本 取回归档判定。"""
+        report = forge.get_check(
+            artifact_root,
+            old_version=None if old_version == "_unversioned" else old_version,
+            new_version=None if new_version == "_unversioned" else new_version,
+            rules_version=rules_version,
+        )
+        if report is None:
+            raise HTTPException(status_code=404, detail="check not found")
         return report.to_dict()
 
     return app

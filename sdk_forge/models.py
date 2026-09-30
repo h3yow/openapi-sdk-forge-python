@@ -98,19 +98,23 @@ class ContractIR:
 class BreakingChange:
     """一条破坏性变更。
 
-    :param location: 精确定位，例如 "GET /items/{id} -> response 200 -> 字段 'name'"。
+    :param location: 精确定位，例如 "GET /items/{id} -> 响应 200.name"。
     :param kind: 变更类别，例如 "field_removed" / "type_narrowed" /
-        "required_added" / "enum_narrowed" / "endpoint_removed" /
-        "parameter_removed" / "response_removed"。
+        "required_added" / "field_became_optional" / "enum_narrowed" /
+        "endpoint_removed" / "parameter_removed" / "response_removed"。
+    :param direction: 数据方向，``"request"``（请求侧：参数/请求体）或
+        ``"response"``（响应侧：响应状态/响应字段）；接口级删除用
+        ``"endpoint"``。同一类变化在两个方向上的判定结论可能相反。
     :param detail: 人类可读的判定依据。
     """
 
     location: str
     kind: str
     detail: str
+    direction: str = "request"
 
     def format(self) -> str:
-        return f"[{self.kind}] {self.location}: {self.detail}"
+        return f"[{self.kind}/{self.direction}] {self.location}: {self.detail}"
 
 
 @dataclass
@@ -132,9 +136,35 @@ class CompatibilityReport:
             "compatible": self.compatible,
             "rules_version": self.rules_version,
             "breaking_changes": [
-                {"location": c.location, "kind": c.kind, "detail": c.detail}
+                {
+                    "location": c.location,
+                    "kind": c.kind,
+                    "direction": c.direction,
+                    "detail": c.detail,
+                }
                 for c in self.breaking_changes
             ],
             "accepted_changes": self.accepted_changes,
             "checked_at": self.checked_at,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CompatibilityReport:
+        """从 :meth:`to_dict` 的结果还原报告（用于读取归档判定）。"""
+        return cls(
+            old_version=data.get("old_version"),
+            new_version=data.get("new_version"),
+            compatible=bool(data.get("compatible")),
+            rules_version=data["rules_version"],
+            breaking_changes=[
+                BreakingChange(
+                    location=c["location"],
+                    kind=c["kind"],
+                    detail=c["detail"],
+                    direction=c.get("direction", "request"),
+                )
+                for c in data.get("breaking_changes", [])
+            ],
+            accepted_changes=list(data.get("accepted_changes", [])),
+            checked_at=data.get("checked_at", ""),
+        )

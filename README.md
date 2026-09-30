@@ -14,12 +14,18 @@
    - 具名对象模型、内联对象模型、字符串枚举、数组、字典、联合/可选类型
 2. **严格契约校验**：契约中缺失或无法解析的片段 **不会被静默跳过**，而是抛出
    带精确定位的可区分错误（见“错误分类”）。
-3. **版本化与兼容性判定**：按规则集版本（`RULES_VERSION`）判定新旧契约，
-   破坏性变更精确到「接口 → 参数/请求体/响应状态 → 字段」。
-4. **稳定的生成过程**：服务不可达、契约版本不匹配、并发重复触发均有确定行为；
-   失败不残留半成品，重复请求不覆盖已完成结果。
-5. **历史可复现**：归档原始契约 + 规则版本号；任意时刻可用
-   `/forge/replay` 复现历史判定，相同输入得到字节级一致的结论。
+3. **版本化与兼容性判定**：请求方向与响应方向使用**各自的兼容语义**判定，
+   破坏性变更精确到「接口 → 方向（request/response）→ 参数/请求体/响应状态 →
+   字段」，每条结论都带 `kind` / `direction` / 定位 / 判定依据。
+4. **规则集冻结与回溯**：至少保留两套有实际差异的规则版本；任意历史结论都
+   能凭契约对 + 规则版本字节级复现，也能一次对比同一演进在不同规则版本下的
+   结论（规则升级前评估影响面）；未知规则版本明确报错，不静默回退。
+5. **稳定的生成与判定过程**：服务不可达、契约版本不匹配、并发重复触发均有
+   确定行为；失败不残留半成品，重复请求不覆盖已完成结果。判定按
+   `新版本/checks/规则版本/旧版本.json` 归档，可查回、可列举。
+6. **历史可复现**：归档原始契约 + 规则版本号；任意时刻可用
+   `/forge/replay` 或 `/forge/compare-rules` 复现/对比历史判定，相同输入
+   得到字节级一致的结论（无时间戳、与执行顺序无关）。
 
 ## 支持的契约范围
 
@@ -40,35 +46,81 @@ OpenAPI **3.x**（FastAPI 默认产出 3.1.0），具体支持：
 非 JSON 媒体类型、`allOf`、悬空/外部 `$ref`、未知 schema `type`、
 空 `paths`、空响应声明、path 参数非必填、非法 `$ref` 目标等。
 
-## 兼容性规则（规则集版本 `2026.09.01`）
+## 兼容性规则（按数据方向分别判定）
 
-以「旧客户端调用新服务」为基准：
+以「旧客户端调用新服务」为基准，**请求方向**（客户端 → 服务端：参数、请求体）
+与**响应方向**（服务端 → 客户端：响应状态、响应字段）语义不同，每条结论都带
+`direction`（`request` / `response`，接口删除为 `endpoint`）。
 
-### 接受（向后兼容）
+### 请求方向（`direction=request`）
 
-- 新增接口
-- 新增 **可选** 的查询/请求头参数
-- 请求体新增 **可选** 字段；必填字段变为可选
-- 响应新增字段（即使响应字段标为必填，旧客户端忽略多余字段）；响应新增状态码
-- 删除必填约束（字段/参数由必填变可选）
-- 类型放宽：`integer → number`；非空 → 可空；`date → date-time → 无 format`
-- 字符串枚举 **新增** 取值；联合类型新增成员；具体类型扩展为包含它的联合
+接受：新增可选参数/字段；参数或字段**必填 → 可选**（客户端不再被强制）；
+请求体本身必填 → 可选；类型放宽；枚举新增取值。
 
-### 拒绝（破坏性变更，报告给出接口与字段定位）
+拒绝（破坏）：
 
 | kind | 含义 |
 | --- | --- |
-| `endpoint_removed` | 接口被删除 |
 | `parameter_removed` | 路径/查询/请求头参数被删除 |
-| `response_removed` | 响应状态或响应体 schema 被删除 |
-| `field_removed` | 请求体/响应字段被删除 |
-| `required_added` | 新增必填参数、必填请求体字段，或可选参数/字段必填化、请求体必填化 |
-| `type_narrowed` | 类型收窄或不兼容变更（如 `string → integer`、可空 → 非空、format 收窄、无约束 → 具体类型） |
-| `enum_narrowed` | 枚举删除取值（同样用于联合类型删除成员） |
-| `body_removed` | 原有请求体被删除 |
+| `field_removed` / `body_removed` | 请求体字段或请求体被删除 |
+| `required_added` | 新增必填参数/必填字段（请求体任意嵌套深度），或可选参数/字段必填化、请求体必填化 |
+| `type_narrowed` / `enum_narrowed` | 请求类型或枚举收窄 |
 
-规则更新时在 `sdk_forge/versioning.py` 提升 `RULES_VERSION`，旧规则集保留在
-`_RULESETS` 注册表中，历史判定可凭 `rules_version` 复现。
+### 响应方向（`direction=response`）
+
+接受：新增响应字段（含必填，旧客户端忽略多余字段）；字段**可选 → 必填**
+（服务端给出更强保证）；新增响应状态；类型放宽；枚举新增取值。
+
+拒绝（破坏）：
+
+| kind | 含义 |
+| --- | --- |
+| `response_removed` | 响应状态或响应体 schema 被删除 |
+| `field_removed` | 响应字段被删除 |
+| `field_became_optional` | 响应字段**必填 → 可选**：服务端可能不再返回，老客户端会读到缺失数据 |
+| `type_narrowed` / `enum_narrowed` | 响应类型或枚举收窄 |
+
+> 典型对比：同一个「必填 ↔ 可选」翻转，在请求方向必填→可选是**放宽**，
+> 在响应方向必填→可选是**破坏**；可选→必填则两方向结论正好相反。
+
+### 规则集版本：冻结与回溯
+
+| 规则版本 | 状态 | 与上一版的实际差异 |
+| --- | --- | --- |
+| `2026.09.01` | 已冻结（`_FrozenRulesV1`，永不改动） | 方向不敏感：字段必填→可选一律接受；新增必填字段仅在**请求体顶层**判破坏 |
+| `2026.09.30` | 当前（`RULES_VERSION`） | 请求/响应分方向判定；请求体任意深度新增必填字段都破坏；响应必填→可选破坏（`field_became_optional`），可选→必填接受 |
+
+* 升级规则时新增一个版本并登记到 `sdk_forge/versioning.py` 的 `RULESETS`，
+  旧版本实现原样保留；`available_rules_versions()` 列出全部版本。
+* `check_with_rules(old, new, version)` / `service.replay(...)` 用指定版本
+  复现：归档/复现的报告**不盖时间戳**，结论经稳定排序，相同输入 + 规则版本
+  永远逐字节一致，与执行顺序无关。
+* `compare_across_rules(old, new)`（HTTP：`/forge/compare-rules`）一次返回
+  同一演进在各规则版本下的结论，用于规则升级前评估影响面：旧规则接受而新
+  规则拒绝的项，就是升级后会新增拦截的演进。
+* 传入未注册版本抛 `UnknownRulesVersionError`（HTTP 404，
+  `code=unknown_rules_version`，响应中带 `available` 列表），绝不静默按当前
+  规则处理。
+
+### 判定归档与触发稳定性
+
+`ForgeService.run_check(...)`（HTTP：`POST /forge/checks`）对同一组
+（旧契约版本, 新契约版本, 规则版本）：
+
+* 已有归档 → 直接取回，**不重复计算、不覆盖**；
+* 正在计算 → 第二个并发请求得到 `CheckInProgressError`（HTTP 409，
+  `code=check_in_progress`），完成后再触发则复用结果；
+* 归档走「临时目录 + fsync + `os.replace`」原子切换，过程中不留半成品，
+  两个请求不会互相写坏或串结果。
+
+归档布局：
+
+```
+artifacts/<新契约版本>/checks/<规则版本>/<旧契约版本>.json
+```
+
+`get_check(...)`（`GET /forge/checks/{new}/{rules}/{old}`）按版本对取回，
+`list_checks(...)`（`GET /forge/checks`）列出全部判定记录。
 
 ## 错误分类（HTTP 状态码 → code）
 
@@ -81,6 +133,8 @@ OpenAPI **3.x**（FastAPI 默认产出 3.1.0），具体支持：
 | 409 | `version_mismatch` | `expected_version` 与运行时版本不一致 |
 | 409 | `incompatible_contract` | 兼容性判定不通过，`detail.breaking_changes` 列出全部破坏项 |
 | 409 | `generation_in_progress` | 同一契约版本已有生成任务在执行 |
+| 409 | `check_in_progress` | 同一组（旧版本, 新版本, 规则版本）判定正在执行 |
+| 404 | `unknown_rules_version` | 规则版本未注册，`detail.available` 给出可用版本，不静默回退 |
 
 ## 生成产物
 
@@ -89,12 +143,15 @@ artifacts/<contract-version>/
 ├── contract.json            # 归档的原始契约（兼容性基线/复现依据）
 ├── manifest.json            # 版本、规则版本、tag 范围、文件清单
 ├── sdk.zip                  # 打包好的 SDK
-└── generated_sdk/
-    ├── __init__.py          # Client / ApiError 导出
-    ├── models.py            # dataclass 模型 + str-Enum
-    ├── client.py            # 按 tag 分组的调用方法
-    ├── metadata.json
-    └── py.typed
+├── generated_sdk/
+│   ├── __init__.py          # Client / ApiError 导出
+│   ├── models.py            # dataclass 模型 + str-Enum
+│   ├── client.py            # 按 tag 分组的调用方法
+│   ├── metadata.json
+│   └── py.typed
+└── checks/
+    └── <规则版本>/
+        └── <旧契约版本>.json  # 归档判定（无时间戳，可逐字节复现）
 ```
 
 写入采用「临时目录 + fsync + `os.replace` 原子切换」：任何失败都会清理临时目录，
@@ -106,7 +163,7 @@ artifacts/<contract-version>/
 # 1. 安装依赖（需要 Python 3.14）
 uv sync --group dev
 
-# 2. 运行全部测试（41 个；-s 会打印契约输入与判定依据日志）
+# 2. 运行全部测试（67 个；-s 会打印契约输入与判定依据日志）
 uv run pytest
 
 # 3. 启动演示服务
@@ -140,15 +197,45 @@ created = client.create_item_items_post(
 # 4xx/5xx 抛 generated_sdk.client.ApiError(status_code, body)
 ```
 
-### 兼容性判定与复现
+### 兼容性判定、跨版本复现与对比
 
 ```bash
-# 拉取运行时契约，与 artifacts/ 中上一版归档契约比对
+# 拉取运行时契约，与 artifacts/ 中上一版归档契约比对（可用 rules_version 指定规则）
 curl -s -X POST http://localhost:8000/forge/check-compatibility -d '{}'
 
-# 用任意两份历史契约复现判定（也可传 rules_version 指定历史规则集）
+# 用任意两份历史契约复现判定（不落盘；传 rules_version 指定历史冻结规则集）
 curl -s -X POST http://localhost:8000/forge/replay -H 'Content-Type: application/json' \
+  -d '{"old_contract": {...}, "new_contract": {...}, "rules_version": "2026.09.01"}'
+
+# 一次对比同一演进在全部（或指定）规则版本下分别判成什么
+curl -s -X POST http://localhost:8000/forge/compare-rules -H 'Content-Type: application/json' \
   -d '{"old_contract": {...}, "new_contract": {...}}'
+
+# 查看可用规则版本；执行判定并归档（重复触发复用、不覆盖）
+curl -s http://localhost:8000/forge/rules-versions
+curl -s -X POST http://localhost:8000/forge/checks -H 'Content-Type: application/json' \
+  -d '{"old_contract": {...}, "new_contract": {...}, "rules_version": "2026.09.30"}'
+# 列出现有判定；按 新版本/规则版本/旧版本 取回单条
+curl -s http://localhost:8000/forge/checks
+curl -s http://localhost:8000/forge/checks/2.0.0/2026.09.30/1.0.0
+```
+
+也可以直接在 Python 中使用：
+
+```python
+from sdk_forge.contract import parse_contract
+from sdk_forge.versioning import (
+    RULES_VERSION, check_with_rules, compare_across_rules,
+    available_rules_versions,
+)
+
+old_ir, new_ir = parse_contract(old_spec), parse_contract(new_spec)
+# 用冻结的旧规则复现
+check_with_rules(old_ir, new_ir, "2026.09.01")
+# 跨版本对比：{version: CompatibilityReport}，升级规则前看影响面
+for version, report in compare_across_rules(old_ir, new_ir).items():
+    print(version, report.compatible,
+          [(c.kind, c.direction, c.location) for c in report.breaking_changes])
 ```
 
 ## 代码结构
@@ -157,9 +244,9 @@ curl -s -X POST http://localhost:8000/forge/replay -H 'Content-Type: application
 | --- | --- |
 | `sdk_forge/contract.py` | 契约获取（标准库 urllib）与 OpenAPI→IR 解析/严格校验 |
 | `sdk_forge/models.py` | 契约 IR 与兼容性报告数据结构 |
-| `sdk_forge/versioning.py` | 规则集版本化的向后兼容判定（schema/operation 级 diff） |
+| `sdk_forge/versioning.py` | 规则集版本化、请求/响应分方向的兼容判定、冻结规则与跨版本对比 |
 | `sdk_forge/generator.py` | IR → 可 import 的客户端包代码与 zip 打包（纯函数） |
-| `sdk_forge/service.py` | 编排：并发去重锁、原子落盘、版本匹配、归档、历史复现 |
+| `sdk_forge/service.py` | 编排：并发去重锁、原子落盘、版本匹配、判定归档/查询、历史复现 |
 | `sdk_forge/errors.py` | 可区分错误类型与 HTTP 状态映射 |
 | `main.py` | 演示业务服务 + `/forge/*` 管理 API |
 | `tests/` | 解析/生成/兼容性/编排/API 测试（以破坏性变更与畸形契约为主要场景） |

@@ -2,13 +2,17 @@
 
 稳定性保证：
 
-* **并发去重**：同一契约版本的并发生成请求，只有一个执行；其余得到
-  :class:`GenerationInProgressError`。生成完成后的重复请求直接返回已完成结果，
-  绝不覆盖。
+* **并发去重（生成与判定各自独立）**：同一契约版本的并发生成请求、或同一组
+  （旧契约版本, 新契约版本, 规则版本）的并发判定请求，只有一个执行；
+  其余得到 :class:`GenerationInProgressError` / :class:`CheckInProgressError`。
+  完成后的重复请求直接返回已完成结果，绝不覆盖、不重复计算。
 * **原子落盘**：先写入同级临时目录并 fsync，再 ``os.replace`` 原子切换；
   任何失败都清理半成品，磁盘上只可能出现"上一版完整产物"或"本次完整产物"。
 * **版本匹配**：调用方声明 ``expected_version`` 时与运行时版本严格比对，
   不一致抛 :class:`VersionMismatchError`。
+* **判定归档可查**：判定按
+  ``artifacts/<新版本>/checks/<规则版本>/<旧版本>.json`` 归档，可按契约
+  版本对 + 规则版本取回，也可列出全部已有判定记录。
 """
 
 from __future__ import annotations
@@ -22,22 +26,24 @@ from pathlib import Path
 
 from .contract import fetch_openapi, parse_contract
 from .errors import (
+    CheckInProgressError,
     ForgeError,
     GenerationInProgressError,
     IncompatibleContractError,
+    UnknownRulesVersionError,
     VersionMismatchError,
 )
 from .generator import generate_sdk, render_sdk_zip
 from .models import CompatibilityReport
 from .versioning import (
     RULES_VERSION,
-    check_backward_compatible,
+    RULESETS,
     check_with_rules,
 )
 
 _CONTRACT_FILE = "contract.json"
 _MANIFEST_FILE = "manifest.json"
-_REPORT_FILE = "compatibility.json"
+_CHECK_DIR = "checks"
 
 
 def _atomic_write_tree(target: Path, files: dict[str, bytes | str]) -> None:
@@ -215,8 +221,127 @@ class ForgeService:
         }
 
     # ------------------------------------------------------------------
-    # 兼容性
+    # 兼容性判定（去重 / 并发 / 归档 / 查询）
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _version_key(version: str | None) -> str:
+        return version or "_unversioned"
+
+    @classmethod
+    def _check_path(
+        cls, output_dir: Path, old_version: str | None,
+        new_version: str | None, rules_version: str,
+    ) -> Path:
+        """判定归档的规范路径（按 新版本/规则/旧版本 存放）。"""
+        return (
+            output_dir
+            / cls._version_key(new_version)
+            / _CHECK_DIR
+            / rules_version
+            / f"{cls._version_key(old_version)}.json"
+        )
+
+    def run_check(
+        self,
+        *,
+        output_dir: Path,
+        old_contract: dict,
+        new_contract: dict,
+        rules_version: str = RULES_VERSION,
+    ) -> CompatibilityReport:
+        """对一对契约按指定规则版本执行判定，带并发去重与原子归档。
+
+        语义：
+
+        * 相同 (old_version, new_version, rules_version) 已有归档：直接复用，
+          不重新计算、不覆盖；
+        * 相同组合正在计算：抛 :class:`CheckInProgressError`，不产生半成品；
+        * 首次计算：原子写入归档后才对外可见。
+        """
+        output_dir = Path(output_dir)
+        if rules_version not in RULESETS:
+            raise UnknownRulesVersionError(rules_version, sorted(RULESETS))
+
+        old_ir = parse_contract(old_contract)
+        new_ir = parse_contract(new_contract)
+        path = self._check_path(
+            output_dir, old_ir.version, new_ir.version, rules_version
+        )
+        slot = f"check:{path.relative_to(output_dir)}"
+
+        # 先看是否已有完成结论（无锁快路径）
+        if path.exists():
+            return self.get_check(
+                output_dir,
+                old_version=old_ir.version,
+                new_version=new_ir.version,
+                rules_version=rules_version,
+            )
+
+        lock = self._acquire(slot)
+        if lock is None:
+            raise CheckInProgressError(slot)
+        try:
+            # 占槽后再查一次：可能在等待期间已被另一请求完成
+            if path.exists():
+                return self.get_check(
+                    output_dir,
+                    old_version=old_ir.version,
+                    new_version=new_ir.version,
+                    rules_version=rules_version,
+                )
+            # 归档结论不盖时间戳：相同输入 + 规则版本 => 逐字节一致
+            report = check_with_rules(old_ir, new_ir, rules_version)
+            _atomic_write_tree(
+                path.parent,
+                {path.name: json.dumps(
+                    report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True
+                )},
+            )
+            return report
+        finally:
+            self._release(slot)
+
+    def get_check(
+        self,
+        output_dir: Path,
+        *,
+        old_version: str | None,
+        new_version: str | None,
+        rules_version: str,
+    ) -> CompatibilityReport:
+        """按契约版本对 + 规则版本取回已归档判定；不存在返回 None。"""
+        path = self._check_path(
+            Path(output_dir), old_version, new_version, rules_version
+        )
+        if not path.exists():
+            return None
+        return CompatibilityReport.from_dict(json.loads(path.read_text()))
+
+    def list_checks(self, output_dir: Path) -> list[dict]:
+        """列出全部已归档判定记录（按 新版本/规则/旧版本 稳定排序）。"""
+        output_dir = Path(output_dir)
+        root = output_dir
+        if not root.exists():
+            return []
+        records: list[dict] = []
+        for new_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+            checks_dir = new_dir / _CHECK_DIR
+            if not checks_dir.is_dir():
+                continue
+            for report_file in sorted(checks_dir.glob("*/*.json")):
+                    report = CompatibilityReport.from_dict(
+                        json.loads(report_file.read_text())
+                    )
+                    records.append({
+                        "old_version": report.old_version,
+                        "new_version": report.new_version,
+                        "rules_version": report.rules_version,
+                        "compatible": report.compatible,
+                        "path": str(report_file),
+                    })
+        return records
 
     def check_compatibility(
         self,
@@ -225,33 +350,63 @@ class ForgeService:
         *,
         timeout: float = 5.0,
         raise_on_breaking: bool = False,
+        rules_version: str = RULES_VERSION,
     ) -> CompatibilityReport:
         output_dir = Path(output_dir)
+        if rules_version not in RULESETS:
+            raise UnknownRulesVersionError(rules_version, sorted(RULESETS))
         spec = fetch_openapi(base_url, timeout=timeout)
         new_ir = parse_contract(spec)
-        version_key = new_ir.version or "_unversioned"
+        version_key = self._version_key(new_ir.version)
 
         # 找上一份归档契约（排除当前版本）
         old_spec = self._latest_archived_contract(output_dir, exclude=version_key)
         if old_spec is None:
-            # 没有历史版本：记录基线并视为兼容
             report = CompatibilityReport(
                 old_version=None,
                 new_version=new_ir.version,
                 compatible=True,
-                rules_version=RULES_VERSION,
+                rules_version=rules_version,
                 accepted_changes=["无历史归档契约，当前版本作为兼容性基线"],
             )
+            path = self._check_path(
+                output_dir, None, new_ir.version, rules_version
+            )
+            # 基线同样遵循"不覆盖、并发互斥"
+            slot = f"check:{path.relative_to(output_dir)}"
+            if path.exists():
+                report = self.get_check(
+                    output_dir, old_version=None, new_version=new_ir.version,
+                    rules_version=rules_version,
+                )
+            else:
+                lock = self._acquire(slot)
+                if lock is None:
+                    raise CheckInProgressError(slot)
+                try:
+                    if path.exists():
+                        report = self.get_check(
+                            output_dir, old_version=None,
+                            new_version=new_ir.version,
+                            rules_version=rules_version,
+                        )
+                    else:
+                        _atomic_write_tree(
+                            path.parent,
+                            {path.name: json.dumps(
+                                report.to_dict(), ensure_ascii=False,
+                                indent=2, sort_keys=True,
+                            )},
+                        )
+                finally:
+                    self._release(slot)
         else:
-            old_ir = parse_contract(old_spec)
-            report = check_backward_compatible(old_ir, new_ir)
-
-        # 判定结论原子归档（按 新版本/rules_version 存放，便于复现）
-        report_dir = output_dir / version_key / "checks" / RULES_VERSION
-        _atomic_write_tree(
-            report_dir,
-            {_REPORT_FILE: json.dumps(report.to_dict(), ensure_ascii=False, indent=2)},
-        )
+            report = self.run_check(
+                output_dir=output_dir,
+                old_contract=old_spec,
+                new_contract=spec,
+                rules_version=rules_version,
+            )
 
         if raise_on_breaking and not report.compatible:
             raise IncompatibleContractError(
@@ -289,13 +444,13 @@ class ForgeService:
     ) -> CompatibilityReport:
         """用历史契约（及可选的历史规则版本）复现判定。
 
-        复现结论不盖时间戳：相同契约 + 相同规则版本 => 完全一致的报告。
+        纯计算、不落盘、不盖时间戳：相同契约 + 相同规则版本 => 完全一致的报告。
+        规则版本不存在时抛 :class:`UnknownRulesVersionError`，不静默回退。
         """
         old_ir = parse_contract(old_contract)
         new_ir = parse_contract(new_contract)
         if rules_version is None:
-            from .versioning import _RULESETS
-            return _RULESETS[RULES_VERSION].check(old_ir, new_ir, stamp_time=False)
+            return RULESETS[RULES_VERSION].check(old_ir, new_ir, stamp_time=False)
         return check_with_rules(old_ir, new_ir, rules_version)
 
 
