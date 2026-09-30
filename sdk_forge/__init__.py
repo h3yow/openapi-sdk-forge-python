@@ -4,12 +4,19 @@ from .errors import (
     ForgeError,
     GenerationInProgressError,
     IncompatibleContractError,
+    JudgementInProgressError,
     MalformedContractError,
     MissingContractFragmentError,
     ServiceUnreachableError,
+    UnknownRulesVersionError,
     VersionMismatchError,
 )
-from .models import CompatibilityReport, ContractIR
+from .models import (
+    AcceptedChange,
+    BreakingChange,
+    CompatibilityReport,
+    ContractIR,
+)
 
 __all__ = [
     "ForgeError",
@@ -19,6 +26,10 @@ __all__ = [
     "VersionMismatchError",
     "IncompatibleContractError",
     "GenerationInProgressError",
+    "JudgementInProgressError",
+    "UnknownRulesVersionError",
     "ContractIR",
     "CompatibilityReport",
+    "BreakingChange",
+    "AcceptedChange",
 ]

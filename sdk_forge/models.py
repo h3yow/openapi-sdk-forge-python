@@ -94,23 +94,45 @@ class ContractIR:
     raw: dict = field(default_factory=dict)
 
 
+# 判定方向：请求侧（旧客户端 -> 新服务）、响应侧（新服务 -> 旧客户端）、接口级。
+DIRECTION_REQUEST = "request"
+DIRECTION_RESPONSE = "response"
+DIRECTION_ENDPOINT = "endpoint"
+
+
 @dataclass
 class BreakingChange:
     """一条破坏性变更。
 
-    :param location: 精确定位，例如 "GET /items/{id} -> response 200 -> 字段 'name'"。
+    :param location: 精确定位，例如 "GET /items/{id} -> 响应 200 -> 字段 'name'"。
     :param kind: 变更类别，例如 "field_removed" / "type_narrowed" /
-        "required_added" / "enum_narrowed" / "endpoint_removed" /
-        "parameter_removed" / "response_removed"。
+        "required_added" / "required_removed" / "enum_narrowed" /
+        "endpoint_removed" / "parameter_removed" / "response_removed"。
     :param detail: 人类可读的判定依据。
+    :param direction: 变化方向，"request"（请求侧）/ "response"（响应侧）/
+        "endpoint"（接口级）。
     """
 
     location: str
     kind: str
     detail: str
+    direction: str = DIRECTION_ENDPOINT
 
     def format(self) -> str:
-        return f"[{self.kind}] {self.location}: {self.detail}"
+        return f"[{self.direction}/{self.kind}] {self.location}: {self.detail}"
+
+
+@dataclass
+class AcceptedChange:
+    """一条被规则接受的非破坏变化（同样带接口/方向/类别定位）。"""
+
+    location: str
+    kind: str
+    detail: str
+    direction: str = DIRECTION_ENDPOINT
+
+    def format(self) -> str:
+        return f"[{self.direction}/{self.kind}] {self.location}: {self.detail}"
 
 
 @dataclass
@@ -122,7 +144,7 @@ class CompatibilityReport:
     compatible: bool
     rules_version: str
     breaking_changes: list[BreakingChange] = field(default_factory=list)
-    accepted_changes: list[str] = field(default_factory=list)
+    accepted_changes: list[AcceptedChange] = field(default_factory=list)
     checked_at: str = ""
 
     def to_dict(self) -> dict:
@@ -132,9 +154,51 @@ class CompatibilityReport:
             "compatible": self.compatible,
             "rules_version": self.rules_version,
             "breaking_changes": [
-                {"location": c.location, "kind": c.kind, "detail": c.detail}
+                {
+                    "location": c.location,
+                    "kind": c.kind,
+                    "detail": c.detail,
+                    "direction": c.direction,
+                }
                 for c in self.breaking_changes
             ],
-            "accepted_changes": self.accepted_changes,
+            "accepted_changes": [
+                {
+                    "location": c.location,
+                    "kind": c.kind,
+                    "detail": c.detail,
+                    "direction": c.direction,
+                }
+                for c in self.accepted_changes
+            ],
             "checked_at": self.checked_at,
         }
+
+
+def report_from_dict(data: dict) -> CompatibilityReport:
+    """把 :meth:`CompatibilityReport.to_dict` 的产物还原为报告对象。"""
+    return CompatibilityReport(
+        old_version=data.get("old_version"),
+        new_version=data.get("new_version"),
+        compatible=bool(data["compatible"]),
+        rules_version=data["rules_version"],
+        breaking_changes=[
+            BreakingChange(
+                location=c["location"],
+                kind=c["kind"],
+                detail=c["detail"],
+                direction=c.get("direction", DIRECTION_ENDPOINT),
+            )
+            for c in data.get("breaking_changes", [])
+        ],
+        accepted_changes=[
+            AcceptedChange(
+                location=c["location"],
+                kind=c["kind"],
+                detail=c["detail"],
+                direction=c.get("direction", DIRECTION_ENDPOINT),
+            )
+            for c in data.get("accepted_changes", [])
+        ],
+        checked_at=data.get("checked_at", ""),
+    )

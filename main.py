@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from sdk_forge.errors import ForgeError
 from sdk_forge.service import ForgeService
+from sdk_forge.versioning import RULES_VERSION
 
 # ---------------------------------------------------------------------------
 # 业务模型与接口（构成被生成的契约）
@@ -51,6 +52,19 @@ class ReplayRequest(BaseModel):
     old_contract: dict
     new_contract: dict
     rules_version: str | None = None
+
+
+class JudgeRequest(BaseModel):
+    old_contract: dict | None = None
+    new_contract: dict
+    rules_version: str | None = None
+    wait: bool = False
+
+
+class CompareRulesRequest(BaseModel):
+    old_contract: dict | None = None
+    new_contract: dict
+    rules_versions: list[str] | None = None
 
 
 def create_app(artifact_root: Path | str | None = None) -> FastAPI:
@@ -163,9 +177,46 @@ def create_app(artifact_root: Path | str | None = None) -> FastAPI:
             )
         except ForgeError as exc:
             _raise_for_forge_error(exc)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return report.to_dict()
+
+    @app.post("/forge/judge", tags=["forge"])
+    def judge_endpoint(req: JudgeRequest):
+        """对一对契约执行判定并归档（幂等、并发去重）。
+
+        并发触发同一组合：默认 409 judgement_in_progress；
+        ``wait=true`` 时等待并复用正在进行的结论。
+        """
+        try:
+            report = forge.judge(
+                old_contract=req.old_contract,
+                new_contract=req.new_contract,
+                output_dir=artifact_root,
+                rules_version=req.rules_version or RULES_VERSION,
+                wait=req.wait,
+            )
+        except ForgeError as exc:
+            _raise_for_forge_error(exc)
+        return report.to_dict()
+
+    @app.get("/forge/judgements", tags=["forge"])
+    def list_judgements_endpoint():
+        """列出已归档判定记录（按 旧版本/新版本/规则版本）。"""
+        return {"judgements": forge.list_judgements(artifact_root)}
+
+    @app.post("/forge/compare-rules", tags=["forge"])
+    def compare_rules_endpoint(req: CompareRulesRequest):
+        """同一份契约演进在各冻结规则版本下的结论对比（规则升级影响面评估）。"""
+        try:
+            compared = forge.compare_rules(
+                old_contract=req.old_contract,
+                new_contract=req.new_contract,
+                versions=req.rules_versions,
+            )
+        except ForgeError as exc:
+            _raise_for_forge_error(exc)
+        return {
+            version: report.to_dict() for version, report in compared.items()
+        }
 
     return app
 

@@ -90,3 +90,32 @@ class GenerationInProgressError(ForgeError):
     def __init__(self, contract_version: str) -> None:
         self.contract_version = contract_version
         super().__init__(f"契约版本 {contract_version} 的生成任务正在进行中")
+
+
+class UnknownRulesVersionError(ForgeError, ValueError):
+    """传入了未注册（未冻结）的规则集版本。
+
+    绝不允许静默回退到当前规则：调用方必须显式改用已注册版本。
+    同时继承 :class:`ValueError`，兼容早期的 ``ValueError`` 捕获。
+    """
+
+    code = "unknown_rules_version"
+    http_status = 400
+
+    def __init__(self, rules_version: str, available: list[str]) -> None:
+        self.rules_version = rules_version
+        self.available = list(available)
+        super().__init__(
+            f"未知的规则版本 {rules_version!r}，已冻结可用: {self.available}"
+        )
+
+
+class JudgementInProgressError(ForgeError):
+    """同一对契约 + 同一规则版本的判定正在执行（并发重复触发）。"""
+
+    code = "judgement_in_progress"
+    http_status = 409
+
+    def __init__(self, key: str) -> None:
+        self.judgement_key = key
+        super().__init__(f"判定 {key} 正在进行中")

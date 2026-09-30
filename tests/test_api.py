@@ -134,3 +134,67 @@ def test_replay_endpoint_rejects_malformed_contract(client):
     resp = client.post("/forge/replay", json={"old_contract": bad, "new_contract": good})
     assert resp.status_code == 422
     assert resp.json()["detail"]["code"] == "malformed_contract"
+
+
+def _resp_required_flip_contracts():
+    old = {
+        "openapi": "3.1.0", "info": {"title": "D", "version": "1"},
+        "paths": {"/a": {"get": {"operationId": "a", "tags": ["x"], "responses": {
+            "200": {"description": "ok", "content": {"application/json": {
+                "schema": {"type": "object", "required": ["f"],
+                           "properties": {"f": {"type": "string"}}}}}}}}}},
+    }
+    new = json.loads(json.dumps(old))
+    new["info"]["version"] = "2"
+    new["paths"]["/a"]["get"]["responses"]["200"]["content"][
+        "application/json"]["schema"]["required"] = []
+    return old, new
+
+
+def test_compare_rules_endpoint_shows_divergence(client):
+    old, new = _resp_required_flip_contracts()
+    logger.info("compare-rules 旧契约: %s\n新契约: %s", old, new)
+    resp = client.post("/forge/compare-rules",
+                       json={"old_contract": old, "new_contract": new})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    logger.info("compare-rules 判定依据: %s", data)
+    assert data["2026.09.01"]["compatible"] is True
+    assert data["2026.10.01"]["compatible"] is False
+    change = data["2026.10.01"]["breaking_changes"][0]
+    assert change["kind"] == "required_removed"
+    assert change["direction"] == "response"
+    assert change["location"].endswith(".f")
+
+
+def test_replay_unknown_rules_version_returns_400(client):
+    old, new = _resp_required_flip_contracts()
+    resp = client.post("/forge/replay", json={
+        "old_contract": old, "new_contract": new,
+        "rules_version": "1999.01.01"})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["code"] == "unknown_rules_version"
+    assert detail["message"]
+
+
+def test_judge_archive_and_list_endpoint(client):
+    old, new = _resp_required_flip_contracts()
+    resp = client.post("/forge/judge", json={
+        "old_contract": old, "new_contract": new,
+        "rules_version": "2026.10.01"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["compatible"] is False
+
+    # 重复触发：复用已完成结论，不重新计算（结论一致）
+    resp2 = client.post("/forge/judge", json={
+        "old_contract": old, "new_contract": new})
+    assert resp2.status_code == 200
+    assert resp2.json() == resp.json()
+
+    listed = client.get("/forge/judgements").json()["judgements"]
+    assert any(
+        j["old_version"] == "1" and j["new_version"] == "2"
+        and j["rules_version"] == "2026.10.01" and j["compatible"] is False
+        for j in listed
+    )

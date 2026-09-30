@@ -2,9 +2,13 @@
 
 稳定性保证：
 
-* **并发去重**：同一契约版本的并发生成请求，只有一个执行；其余得到
+* **并发去重（生成）**：同一契约版本的并发生成请求，只有一个执行；其余得到
   :class:`GenerationInProgressError`。生成完成后的重复请求直接返回已完成结果，
   绝不覆盖。
+* **判定归档与幂等**：判定按「旧契约版本 + 新契约版本 + 规则版本」唯一归档。
+  同一组合重复触发直接复用已完成结论，不重复计算、不覆盖；并发触发同一组合时，
+  默认抛 :class:`JudgementInProgressError`，``wait=True`` 时等待并复用同一份结论。
+  落盘仍是原子切换，过程中不会留下半成品，并发请求之间不会串结果。
 * **原子落盘**：先写入同级临时目录并 fsync，再 ``os.replace`` 原子切换；
   任何失败都清理半成品，磁盘上只可能出现"上一版完整产物"或"本次完整产物"。
 * **版本匹配**：调用方声明 ``expected_version`` 时与运行时版本严格比对，
@@ -19,25 +23,42 @@ import shutil
 import tempfile
 import threading
 from pathlib import Path
+from urllib.parse import quote
 
 from .contract import fetch_openapi, parse_contract
 from .errors import (
     ForgeError,
     GenerationInProgressError,
     IncompatibleContractError,
+    JudgementInProgressError,
+    UnknownRulesVersionError,
     VersionMismatchError,
 )
 from .generator import generate_sdk, render_sdk_zip
-from .models import CompatibilityReport
+from .models import (
+    AcceptedChange,
+    CompatibilityReport,
+    report_from_dict,
+)
 from .versioning import (
     RULES_VERSION,
-    check_backward_compatible,
+    available_rules_versions,
     check_with_rules,
+    compare_across_rules,
 )
 
 _CONTRACT_FILE = "contract.json"
 _MANIFEST_FILE = "manifest.json"
 _REPORT_FILE = "compatibility.json"
+
+# 判定归档（与按版本的生成产物并列，集中存放，便于查询与列举）
+_JUDGEMENTS_DIR = "_judgements"
+_JUDGE_META_FILE = "meta.json"
+_JUDGE_REPORT_FILE = "report.json"
+_JUDGE_OLD_FILE = "old_contract.json"
+_JUDGE_NEW_FILE = "new_contract.json"
+# 没有历史契约（基线判定）时旧版本槽位的编码
+_BASELINE_KEY = "__baseline__"
 
 
 def _atomic_write_tree(target: Path, files: dict[str, bytes | str]) -> None:
@@ -92,6 +113,8 @@ class ForgeService:
         # key 为契约版本；拉取契约（尚不知版本）时用 _FETCH_SLOT/<base_url>。
         self._inflight: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
+        # 判定去重：judge_key -> 进行中条目的同步原语与结果
+        self._judging: dict[str, dict] = {}
 
     def _acquire(self, slot: str) -> threading.Lock | None:
         """尝试占用某槽位；已被占用时返回 None。"""
@@ -215,8 +238,181 @@ class ForgeService:
         }
 
     # ------------------------------------------------------------------
-    # 兼容性
+    # 兼容性判定（归档 / 去重 / 并发 / 查询）
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _judge_key(
+        old_version: str | None, new_version: str | None, rules_version: str
+    ) -> str:
+        ov = old_version or _BASELINE_KEY
+        nv = new_version or "_unversioned"
+        return f"{quote(ov, safe='')}__{quote(nv, safe='')}__{quote(rules_version, safe='')}"
+
+    def _judgement_dir(
+        self,
+        output_dir: Path,
+        old_version: str | None,
+        new_version: str | None,
+        rules_version: str,
+    ) -> Path:
+        return (
+            Path(output_dir)
+            / _JUDGEMENTS_DIR
+            / self._judge_key(old_version, new_version, rules_version)
+        )
+
+    @staticmethod
+    def _load_judgement(dirpath: Path) -> CompatibilityReport:
+        return report_from_dict(
+            json.loads((dirpath / _JUDGE_REPORT_FILE).read_text())
+        )
+
+    def _try_load_archived(
+        self,
+        output_dir: Path,
+        old_version: str | None,
+        new_version: str | None,
+        rules_version: str,
+    ) -> CompatibilityReport | None:
+        report_file = (
+            self._judgement_dir(output_dir, old_version, new_version, rules_version)
+            / _JUDGE_REPORT_FILE
+        )
+        return self._load_judgement(report_file.parent) if report_file.exists() else None
+
+    def judge(
+        self,
+        *,
+        old_contract: dict | None,
+        new_contract: dict,
+        output_dir: Path,
+        rules_version: str = RULES_VERSION,
+        wait: bool = False,
+    ) -> CompatibilityReport:
+        """对一对契约执行判定并归档；幂等且并发安全。
+
+        * ``old_contract=None`` 表示基线判定（无历史契约）。
+        * 相同（旧版本, 新版本, 规则版本）已有归档：直接返回，不重复计算。
+        * 相同组合正在进行：``wait=False`` 抛 :class:`JudgementInProgressError`；
+          ``wait=True`` 阻塞到对方完成后复用同一份结论（对方失败则同步抛出）。
+        * 归档目录按组合隔离 + 原子写入：不会留下半成品，不会互相写坏。
+        """
+        output_dir = Path(output_dir)
+        if rules_version not in available_rules_versions():
+            raise UnknownRulesVersionError(rules_version, available_rules_versions())
+
+        new_ir = parse_contract(new_contract)
+        old_ir = parse_contract(old_contract) if old_contract is not None else None
+        old_version = old_ir.version if old_ir is not None else None
+        new_version = new_ir.version
+        key = self._judge_key(old_version, new_version, rules_version)
+        target_dir = output_dir / _JUDGEMENTS_DIR / key
+
+        # 快路径：已归档，直接复用（不触碰任何进行中状态）
+        if (target_dir / _JUDGE_REPORT_FILE).exists():
+            return self._load_judgement(target_dir)
+
+        is_worker = False
+        with self._guard:
+            # 双重检查：拿锁前可能已由别的线程落盘
+            if (target_dir / _JUDGE_REPORT_FILE).exists():
+                return self._load_judgement(target_dir)
+            inflight = self._judging.get(key)
+            if inflight is not None:
+                if not wait:
+                    raise JudgementInProgressError(key)
+                holder = inflight  # 本地持有：worker 弹出槽位后仍能取到结果
+            else:
+                holder = {
+                    "event": threading.Event(),
+                    "report": None,
+                    "error": None,
+                }
+                self._judging[key] = holder
+                is_worker = True
+
+        if not is_worker:
+            # 等待方：复用 worker 结论，绝不重复计算
+            holder["event"].wait()
+            if holder["report"] is not None:
+                return holder["report"]
+            # worker 成功落盘（槽位已弹出）也能直接取回
+            if (target_dir / _JUDGE_REPORT_FILE).exists():
+                return self._load_judgement(target_dir)
+            # 抛出与 worker 同类的可区分错误，避免静默按成功处理
+            if holder["error"] is not None:
+                raise holder["error"]
+            raise JudgementInProgressError(key)
+        # worker 路径：唯一负责计算与落盘
+        try:
+            report = self._compute_judgement(
+                old_ir, new_ir, rules_version, output_dir,
+                old_contract, new_contract,
+                old_version, new_version, target_dir,
+            )
+            holder["report"] = report
+            return report
+        except BaseException as exc:
+            holder["error"] = exc
+            raise
+        finally:
+            with self._guard:
+                self._judging.pop(key, None)
+            # 结果已写入本地 holder；弹出槽位后再唤醒，等待方凭 holder 必能读到结论
+            holder["event"].set()
+
+    def _compute_judgement(
+        self,
+        old_ir,
+        new_ir,
+        rules_version: str,
+        output_dir: Path,
+        old_contract: dict | None,
+        new_contract: dict,
+        old_version: str | None,
+        new_version: str | None,
+        target_dir: Path,
+    ) -> CompatibilityReport:
+        if old_ir is None:
+            report = CompatibilityReport(
+                old_version=None,
+                new_version=new_version,
+                compatible=True,
+                rules_version=rules_version,
+                accepted_changes=[AcceptedChange(
+                    location="(baseline)",
+                    kind="baseline_registered",
+                    detail="无历史归档契约，当前版本作为兼容性基线",
+                    direction="endpoint",
+                )],
+            )
+        else:
+            # 归档判定一律不盖时间戳：相同输入逐字节一致，可任意复现
+            report = check_with_rules(old_ir, new_ir, rules_version)
+
+        meta = {
+            "old_version": old_version,
+            "new_version": new_version,
+            "rules_version": rules_version,
+            "compatible": report.compatible,
+        }
+        files: dict[str, str] = {
+            _JUDGE_META_FILE: json.dumps(meta, ensure_ascii=False, indent=2,
+                                         sort_keys=True),
+            _JUDGE_REPORT_FILE: json.dumps(
+                report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True
+            ),
+            _JUDGE_NEW_FILE: json.dumps(
+                new_contract, ensure_ascii=False, indent=2, sort_keys=True
+            ),
+        }
+        if old_contract is not None:
+            files[_JUDGE_OLD_FILE] = json.dumps(
+                old_contract, ensure_ascii=False, indent=2, sort_keys=True
+            )
+        _atomic_write_tree(target_dir, files)
+        return report
 
     def check_compatibility(
         self,
@@ -225,6 +421,7 @@ class ForgeService:
         *,
         timeout: float = 5.0,
         raise_on_breaking: bool = False,
+        rules_version: str = RULES_VERSION,
     ) -> CompatibilityReport:
         output_dir = Path(output_dir)
         spec = fetch_openapi(base_url, timeout=timeout)
@@ -233,24 +430,22 @@ class ForgeService:
 
         # 找上一份归档契约（排除当前版本）
         old_spec = self._latest_archived_contract(output_dir, exclude=version_key)
-        if old_spec is None:
-            # 没有历史版本：记录基线并视为兼容
-            report = CompatibilityReport(
-                old_version=None,
-                new_version=new_ir.version,
-                compatible=True,
-                rules_version=RULES_VERSION,
-                accepted_changes=["无历史归档契约，当前版本作为兼容性基线"],
-            )
-        else:
-            old_ir = parse_contract(old_spec)
-            report = check_backward_compatible(old_ir, new_ir)
 
-        # 判定结论原子归档（按 新版本/rules_version 存放，便于复现）
-        report_dir = output_dir / version_key / "checks" / RULES_VERSION
+        # 走统一的判定管线：幂等、并发去重、原子归档到 _judgements/
+        report = self.judge(
+            old_contract=old_spec,
+            new_contract=spec,
+            output_dir=output_dir,
+            rules_version=rules_version,
+            wait=True,
+        )
+
+        # 兼容旧布局：按版本目录再镜像一份报告（整体原子写，永不覆盖为半成品）
+        report_dir = output_dir / version_key / "checks" / rules_version
         _atomic_write_tree(
             report_dir,
-            {_REPORT_FILE: json.dumps(report.to_dict(), ensure_ascii=False, indent=2)},
+            {_REPORT_FILE: json.dumps(report.to_dict(), ensure_ascii=False,
+                                      indent=2, sort_keys=True)},
         )
 
         if raise_on_breaking and not report.compatible:
@@ -258,6 +453,36 @@ class ForgeService:
                 [c.format() for c in report.breaking_changes]
             )
         return report
+
+    def get_judgement(
+        self,
+        *,
+        output_dir: Path,
+        new_version: str,
+        rules_version: str,
+        old_version: str | None = None,
+    ) -> CompatibilityReport:
+        """按契约版本 + 规则版本取回已归档判定；不存在返回 None。"""
+        found = self._try_load_archived(
+            Path(output_dir), old_version, new_version, rules_version
+        )
+        if found is None:
+            raise KeyError(
+                self._judge_key(old_version, new_version, rules_version)
+            )
+        return found
+
+    def list_judgements(self, output_dir: Path) -> list[dict]:
+        """列出全部已归档判定记录的摘要（按 key 排序，顺序稳定）。"""
+        root = Path(output_dir) / _JUDGEMENTS_DIR
+        if not root.exists():
+            return []
+        records: list[dict] = []
+        for d in sorted(root.iterdir(), key=lambda p: p.name):
+            meta_path = d / _JUDGE_META_FILE
+            if d.is_dir() and meta_path.exists():
+                records.append(json.loads(meta_path.read_text()))
+        return records
 
     @staticmethod
     def _latest_archived_contract(output_dir: Path, *, exclude: str) -> dict | None:
@@ -289,14 +514,55 @@ class ForgeService:
     ) -> CompatibilityReport:
         """用历史契约（及可选的历史规则版本）复现判定。
 
-        复现结论不盖时间戳：相同契约 + 相同规则版本 => 完全一致的报告。
+        纯计算、不落盘、不盖时间戳：相同契约 + 相同规则版本 => 完全一致的报告。
+        未注册的规则版本抛 :class:`UnknownRulesVersionError`（``ValueError`` 子类）。
         """
         old_ir = parse_contract(old_contract)
         new_ir = parse_contract(new_contract)
-        if rules_version is None:
-            from .versioning import _RULESETS
-            return _RULESETS[RULES_VERSION].check(old_ir, new_ir, stamp_time=False)
-        return check_with_rules(old_ir, new_ir, rules_version)
+        return check_with_rules(
+            old_ir, new_ir, rules_version or RULES_VERSION
+        )
+
+    def compare_rules(
+        self,
+        *,
+        old_contract: dict | None,
+        new_contract: dict,
+        versions: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, CompatibilityReport]:
+        """同一份契约演进在各冻结规则版本下分别判成什么（影响面评估）。
+
+        返回 ``{rules_version: report}``（旧规则 -> 新规则排序）；
+        ``old_contract=None`` 时所有版本都得到兼容基线。
+        """
+        old_ir = parse_contract(old_contract) if old_contract is not None else None
+        new_ir = parse_contract(new_contract)
+        if old_ir is None:
+            chosen = (
+                list(versions) if versions is not None
+                else available_rules_versions()
+            )
+            unknown = [v for v in chosen if v not in available_rules_versions()]
+            if unknown:
+                raise UnknownRulesVersionError(
+                    unknown[0], available_rules_versions()
+                )
+            return {
+                v: CompatibilityReport(
+                    old_version=None,
+                    new_version=new_ir.version,
+                    compatible=True,
+                    rules_version=v,
+                    accepted_changes=[AcceptedChange(
+                        location="(baseline)",
+                        kind="baseline_registered",
+                        detail="无历史归档契约，当前版本作为兼容性基线",
+                        direction="endpoint",
+                    )],
+                )
+                for v in sorted(chosen)
+            }
+        return compare_across_rules(old_ir, new_ir, versions)
 
 
 # 模块级便捷接口（保留 service.py 早期骨架的 API 形状）
@@ -340,4 +606,55 @@ def replay_report(
         old_contract=old_contract,
         new_contract=new_contract,
         rules_version=rules_version,
+    )
+
+
+def judge_contracts(
+    *,
+    old_contract: dict | None,
+    new_contract: dict,
+    output_dir: Path,
+    rules_version: str | None = None,
+    wait: bool = False,
+) -> CompatibilityReport:
+    """执行并归档判定（幂等、并发去重）。"""
+    return _default_service.judge(
+        old_contract=old_contract,
+        new_contract=new_contract,
+        output_dir=Path(output_dir),
+        rules_version=rules_version or RULES_VERSION,
+        wait=wait,
+    )
+
+
+def list_judgements(output_dir: Path) -> list[dict]:
+    """列举已归档判定记录摘要。"""
+    return _default_service.list_judgements(Path(output_dir))
+
+
+def get_judgement(
+    *,
+    output_dir: Path,
+    new_version: str,
+    rules_version: str,
+    old_version: str | None = None,
+) -> CompatibilityReport:
+    """按契约版本 + 规则版本取回已归档判定。"""
+    return _default_service.get_judgement(
+        output_dir=Path(output_dir),
+        new_version=new_version,
+        rules_version=rules_version,
+        old_version=old_version,
+    )
+
+
+def compare_rules_for_contracts(
+    *,
+    old_contract: dict | None,
+    new_contract: dict,
+    versions: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, CompatibilityReport]:
+    """同一份演进跨规则版本对比（不落盘）。"""
+    return _default_service.compare_rules(
+        old_contract=old_contract, new_contract=new_contract, versions=versions
     )
