@@ -6,10 +6,13 @@
 
 兼容性总原则：旧客户端 + 新服务。请求方向与响应方向语义不同，分开判定：
 
-请求方向（客户端 -> 服务端，沿用 2026.09.01 起的规则）：
+请求方向（客户端 -> 服务端）：
 
 * 新增必填参数/请求体字段、删除参数/字段、可选 -> 必填、类型收窄、枚举收窄：拒绝
 * 新增可选参数/字段、必填 -> 可选、类型放宽、枚举新增取值：接受
+* 「新增必填字段判破坏」的覆盖深度随规则版本冻结：2026.09.01 只覆盖请求体
+  **顶层**对象（嵌套对象/参数对象内的必填新增当时按放宽接受）；
+  2026.10.01 起覆盖请求方向任意嵌套深度。旧版本语义不得就地修改。
 
 响应方向（服务端 -> 客户端，2026.10.01 起与请求方向分离）：
 
@@ -38,9 +41,11 @@ from .models import (
     DIRECTION_RESPONSE,
 )
 
-# 旧规则集（冻结）：响应方向「必填 -> 可选」当时按放宽处理。
+# 旧规则集（冻结）：响应方向「必填 -> 可选」当时按放宽处理；
+# 请求方向「新增必填字段判破坏」当时只覆盖请求体顶层对象。
 RULES_VERSION_2026_09 = "2026.09.01"
-# 当前规则集：响应方向「必填 -> 可选」判为破坏。
+# 当前规则集：响应方向「必填 -> 可选」判为破坏；
+# 请求方向「新增必填字段判破坏」覆盖任意嵌套深度。
 RULES_VERSION = "2026.10.01"
 
 # 类型放宽关系：old -> 允许的 new 集合（consumer 收到更宽的值安全）
@@ -135,11 +140,21 @@ class _RuleSet:
 
     :param response_required_relaxed: 响应方向「必填 -> 可选」是否按放宽接受。
         2026.09.01 为 True（历史行为），2026.10.01 起为 False（判为破坏）。
+    :param request_required_deep: 请求方向「新增必填字段判破坏」是否覆盖任意
+        嵌套深度。2026.09.01 为 False（只覆盖请求体顶层对象，嵌套必填新增
+        按放宽接受），2026.10.01 起为 True。
     """
 
-    def __init__(self, version: str, *, response_required_relaxed: bool) -> None:
+    def __init__(
+        self,
+        version: str,
+        *,
+        response_required_relaxed: bool,
+        request_required_deep: bool,
+    ) -> None:
         self.version = version
         self.response_required_relaxed = response_required_relaxed
+        self.request_required_deep = request_required_deep
 
     # -- schema 级 -----------------------------------------------------------
 
@@ -152,16 +167,21 @@ class _RuleSet:
         location: str,
         accepted: list[AcceptedChange],
         direction: str,
+        *,
+        body_root: bool = False,
     ) -> list[BreakingChange]:
         """比较两处 schema，返回破坏性变更。
 
         :param direction: ``DIRECTION_REQUEST`` / ``DIRECTION_RESPONSE``，
             必填性语义随方向变化；删字段、类型/枚举收窄两个方向一致拒绝。
+        :param body_root: 是否为请求体顶层对象。旧规则（2026.09.01）的
+            「新增必填字段判破坏」只覆盖这一层，嵌套层按放宽接受。
         """
         o = _normalize(old_raw, spec_old)
         n = _normalize(new_raw, spec_new)
         return self._diff_normalized(
-            o, n, spec_old, spec_new, location, accepted, direction
+            o, n, spec_old, spec_new, location, accepted, direction,
+            body_root=body_root,
         )
 
     def _diff_normalized(
@@ -173,6 +193,8 @@ class _RuleSet:
         location: str,
         accepted: list[AcceptedChange],
         direction: str,
+        *,
+        body_root: bool = False,
     ) -> list[BreakingChange]:
         changes: list[BreakingChange] = []
 
@@ -263,7 +285,8 @@ class _RuleSet:
         if nt == "object" and ("properties" in o or "properties" in n):
             changes.extend(
                 self._diff_object(
-                    o, n, spec_old, spec_new, location, accepted, direction
+                    o, n, spec_old, spec_new, location, accepted, direction,
+                    body_root=body_root,
                 )
             )
 
@@ -340,6 +363,8 @@ class _RuleSet:
         location: str,
         accepted: list[AcceptedChange],
         direction: str,
+        *,
+        body_root: bool = False,
     ) -> list[BreakingChange]:
         changes: list[BreakingChange] = []
         old_props = o.get("properties", {})
@@ -396,11 +421,19 @@ class _RuleSet:
             if fname not in old_props:
                 floc = f"{location}.{fname}"
                 if direction == DIRECTION_REQUEST and fname in new_required:
-                    # 请求方向新增必填字段：破坏
-                    changes.append(BreakingChange(
-                        floc, "required_added",
-                        f"请求体新增必填字段 {fname!r}", direction,
-                    ))
+                    if self.request_required_deep or body_root:
+                        # 请求方向新增必填字段：破坏
+                        changes.append(BreakingChange(
+                            floc, "required_added",
+                            f"请求体新增必填字段 {fname!r}", direction,
+                        ))
+                    else:
+                        # 2026.09.01 冻结语义：必填新增判破坏只覆盖请求体顶层，
+                        # 嵌套层（嵌套对象/参数对象/数组元素）当时按放宽接受
+                        _acc(accepted, floc, "field_added",
+                             f"新增必填字段 {fname!r}（旧规则仅请求体顶层必填新增"
+                             f"判破坏，嵌套层按放宽接受）",
+                             direction)
                 elif direction == DIRECTION_RESPONSE:
                     # 响应新增字段（即使必填）：旧客户端忽略多余字段，接受
                     _acc(accepted, floc, "field_added",
@@ -541,6 +574,7 @@ class _RuleSet:
                     self.diff_schemas(
                         ob.schema_raw, nb.schema_raw,
                         spec_old, spec_new, bloc, accepted, DIRECTION_REQUEST,
+                        body_root=True,
                     )
                 )
 
@@ -579,10 +613,14 @@ class _RuleSet:
 # 规则注册表：复现历史判定时按版本取用；条目一经发布即冻结，不得就地修改。
 _RULESETS: dict[str, _RuleSet] = {
     RULES_VERSION_2026_09: _RuleSet(
-        RULES_VERSION_2026_09, response_required_relaxed=True
+        RULES_VERSION_2026_09,
+        response_required_relaxed=True,
+        request_required_deep=False,
     ),
     RULES_VERSION: _RuleSet(
-        RULES_VERSION, response_required_relaxed=False
+        RULES_VERSION,
+        response_required_relaxed=False,
+        request_required_deep=True,
     ),
 }
 

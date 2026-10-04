@@ -61,6 +61,10 @@ OpenAPI **3.x**（FastAPI 默认产出 3.1.0），具体支持：
 | 类型收窄（如 `number → integer`、可空→非空、format 收窄）、枚举收窄 | 拒绝（`type_narrowed` / `enum_narrowed`） |
 | 新增**可选**参数/字段、必填→可选、类型放宽、枚举新增取值 | 接受 |
 
+> 「新增必填字段判破坏」的覆盖深度随规则版本冻结：`2026.09.01` 只覆盖请求体
+> **顶层**对象（嵌套对象/参数对象内的必填新增当时按放宽接受，登记为
+> `field_added` 接受项）；`2026.10.01` 起覆盖请求方向任意嵌套深度。
+
 ### 响应方向（`response`，新服务向旧客户端回数据）
 
 | 变化 | 结论 |
@@ -84,8 +88,15 @@ OpenAPI **3.x**（FastAPI 默认产出 3.1.0），具体支持：
 
 | 规则版本 | 与上一版的实际差异 |
 | --- | --- |
-| `2026.09.01`（冻结） | 响应字段「必填→可选」当时按放宽接受 |
-| `2026.10.01`（当前，`RULES_VERSION`） | 同样的变化改判为破坏（`required_removed`）；请求/响应方向分离 |
+| `2026.09.01`（冻结） | 响应字段「必填→可选」当时按放宽接受；请求方向「新增必填字段判破坏」只覆盖请求体顶层对象 |
+| `2026.10.01`（当前，`RULES_VERSION`） | 响应字段「必填→可选」改判破坏（`required_removed`），请求/响应方向分离；请求方向「新增必填字段判破坏」覆盖任意嵌套深度 |
+
+**冻结与回溯的含义**：规则版本号就是一份不可变的判定语义。某个版本一经发布，
+其注册表条目（`_RULESETS`）不得就地修改——更严的检查只能以新版本号发布。
+因此「同一份契约演进 + 同一个已发布规则版本」在任意时刻重跑，结论、定位
+（`location`）、类别（`kind`）与依据（`detail`）都与当初归档的逐字节一致；
+新规则可以比旧规则更严，但永远不会改变旧版本对历史演进的判定。归档目录里
+保存了原始契约快照与 `rules_version`，正是回溯复现的全部依据。
 
 - **复现**：`check_with_rules(old, new, "2026.09.01")` 用旧规则重跑，
   `check_with_rules(old, new, "2026.10.01")` 用新规则重跑。复现不盖时间戳，
@@ -160,6 +171,14 @@ artifacts/
 `409 judgement_in_progress`，传 `wait=true` 则等待并复用正在进行的同一份结论
 （worker 失败时等待方收到同一失败，且不留下半成品）。
 
+**并发触发兼容性检查（`/forge/check-compatibility`）**：该链路内部以 `wait`
+模式复用判定结论——同一对契约、同一规则版本被并发触发时，每个请求要么复用
+已完成的同一份结论，要么（经 `/forge/judge`）明确收到 `409 judgement_in_progress`，
+绝不因并发报内部错误。判定归档由单一 worker 计算落盘；按版本目录的镜像报告
+（`checks/<rules-version>/compatibility.json`）在目标路径锁内串行写入，
+内容未变时跳过写入——并发请求之间不会互相写坏、不会留下半成品临时目录，
+已完成的结论不会被覆盖。
+
 ## 本地验证方法
 
 ```bash
@@ -170,6 +189,13 @@ uv sync --group dev
 uv run pytest
 #    重点：tests/test_versioning.py（方向语义、规则冻结/复现/对比）
 #          tests/test_service.py（判定幂等、并发去重、归档查询）
+
+# 2a. 只验证「并发触发兼容性检查」：对外链路 10 并发 x 2 轮 + HTTP 判定并发
+uv run pytest -s -k "concurrent" tests/test_service.py tests/test_api.py
+
+# 2b. 只验证「规则版本冻结与回溯」：嵌套必填新增在旧规则下复现 + 跨版本对比
+uv run pytest -s -k "nested_required or frozen or replay or compare" \
+  tests/test_versioning.py tests/test_service.py
 
 # 3. 启动演示服务
 uv run uvicorn main:app --reload
@@ -207,10 +233,22 @@ created = client.create_item_items_post(
 ```bash
 # 拉取运行时契约，与 artifacts/ 中上一版归档契约比对（结论同步归档）
 curl -s -X POST http://localhost:8000/forge/check-compatibility -d '{}'
+# 可指定已冻结的规则版本；未冻结的版本返回 400 unknown_rules_version
+curl -s -X POST http://localhost:8000/forge/check-compatibility \
+  -H 'Content-Type: application/json' -d '{"rules_version": "2026.09.01"}'
 
 # 直接对一对契约做判定并归档（幂等；并发可加 "wait": true 等待复用）
 curl -s -X POST http://localhost:8000/forge/judge -H 'Content-Type: application/json' \
   -d '{"old_contract": {...}, "new_contract": {...}, "rules_version": "2026.10.01"}'
+
+# 并发验证：同时发 10 个相同判定请求，响应只会是 200（同一份结论）
+# 或 409 judgement_in_progress，不会出现 5xx，artifacts/ 下无 .* 临时目录
+for i in $(seq 10); do
+  curl -s -o "judge-$i.json" -w '%{http_code}\n' -X POST \
+    http://localhost:8000/forge/judge -H 'Content-Type: application/json' \
+    -d '{"old_contract": {...}, "new_contract": {...}}' &
+done; wait
+```
 
 # 列出已归档判定、按契约版本+规则版本查回
 curl -s http://localhost:8000/forge/judgements

@@ -48,6 +48,13 @@ class GenerateRequest(BaseModel):
     include_tags: list[str] | None = ["items"]
 
 
+class CheckCompatibilityRequest(BaseModel):
+    base_url: str | None = None
+    timeout: float = 5.0
+    # 缺省按当前规则版本判定；传入未冻结的版本会返回 400 unknown_rules_version
+    rules_version: str | None = None
+
+
 class ReplayRequest(BaseModel):
     old_contract: dict
     new_contract: dict
@@ -154,13 +161,19 @@ def create_app(artifact_root: Path | str | None = None) -> FastAPI:
         )
 
     @app.post("/forge/check-compatibility", tags=["forge"])
-    def check_compatibility_endpoint(req: GenerateRequest, request: Request):
-        """拉取运行时契约，与已归档的上一版契约做兼容性判定。"""
+    def check_compatibility_endpoint(req: CheckCompatibilityRequest,
+                                     request: Request):
+        """拉取运行时契约，与已归档的上一版契约做兼容性判定。
+
+        并发触发同一组合时复用同一份结论（内部按 wait 模式去重）；
+        ``rules_version`` 未冻结时返回 400 ``unknown_rules_version``。
+        """
         try:
             report = forge.check_compatibility(
                 req.base_url or str(request.base_url).rstrip("/"),
                 artifact_root,
                 timeout=req.timeout,
+                rules_version=req.rules_version or RULES_VERSION,
             )
             return report.to_dict()
         except ForgeError as exc:

@@ -198,3 +198,96 @@ def test_judge_archive_and_list_endpoint(client):
         and j["rules_version"] == "2026.10.01" and j["compatible"] is False
         for j in listed
     )
+
+
+# ---------------------------------------------------------------------------
+# 回归：对外 HTTP 链路的并发触发与未知规则版本（bugfix-a）
+# ---------------------------------------------------------------------------
+
+def test_check_compatibility_unknown_rules_version_returns_400(client, tmp_path):
+    logger.info("业务场景: HTTP 兼容性检查传入未知规则版本; "
+                "用例: 400 + 可区分 code + 无残留")
+    resp = client.post("/forge/check-compatibility",
+                       json={"rules_version": "1999.01.01", "timeout": 0.5})
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["code"] == "unknown_rules_version"
+    assert "1999.01.01" in detail["message"]
+    # 不留任何残留结果
+    root = tmp_path / "artifacts"
+    assert not root.exists() or list(root.iterdir()) == []
+
+
+def test_judge_endpoint_concurrent_trigger_only_progress_or_reuse(
+    client, tmp_path, monkeypatch
+):
+    """并发触发同一组合：每个请求只会得到 200（同一份结论）或
+    409 judgement_in_progress；不出现 5xx，不落半成品，不互相串结果。"""
+    from sdk_forge.service import ForgeService
+
+    old, new = _resp_required_flip_contracts()
+
+    entered = threading.Event()
+    release = threading.Event()
+    orig = ForgeService._compute_judgement
+
+    def slow_compute(self2, *a, **k):
+        entered.set()
+        release.wait(timeout=10)
+        return orig(self2, *a, **k)
+
+    monkeypatch.setattr(ForgeService, "_compute_judgement", slow_compute)
+    logger.info("业务场景: HTTP 判定链路并发触发; "
+                "用例: 8 并发 wait=false + 8 并发 wait=true")
+
+    results: list = []
+
+    def fire(wait_flag):
+        resp = client.post("/forge/judge", json={
+            "old_contract": old, "new_contract": new, "wait": wait_flag})
+        results.append((resp.status_code, resp.json()))
+
+    # 第一波波：wait=false，只许 200 或 409
+    t0 = threading.Thread(target=fire, args=(False,))
+    t0.start()
+    assert entered.wait(5), "首个请求应成为 worker 并进入计算"
+    barrier = threading.Barrier(7)
+    def fire_sync():
+        barrier.wait(timeout=5)
+        fire(False)
+    threads = [threading.Thread(target=fire_sync) for _ in range(7)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    release.set()
+    t0.join(10)
+
+    codes = sorted(code for code, _ in results)
+    logger.info("wait=false 并发响应码: %s", codes)
+    assert all(c in (200, 409) for c in codes), f"不得出现内部错误: {codes}"
+    assert 409 in codes, "并发下应至少有一个明确收到“正在进行中”"
+    for code, body in results:
+        if code == 409:
+            assert body["detail"]["code"] == "judgement_in_progress"
+    oks = [body for code, body in results if code == 200]
+    assert oks and all(b == oks[0] for b in oks), "成功的并发响应必须是同一份结论"
+
+    # 第二波：wait=true，全部复用同一份已完成结论
+    results.clear()
+    threads = [threading.Thread(target=fire, args=(True,)) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert all(code == 200 for code, _ in results)
+    assert all(body == oks[0] for _, body in results), "复用结论必须与首次一致"
+
+    # 归档只有一条记录，且磁盘无半成品
+    listed = client.get("/forge/judgements").json()["judgements"]
+    assert len(listed) == 1
+    root = tmp_path / "artifacts"
+    leftovers = [str(p) for p in root.rglob("*")
+                 if p.name.startswith(".") or p.name.endswith(".old")]
+    assert leftovers == []
+    logger.info("并发后归档记录: %s", listed)

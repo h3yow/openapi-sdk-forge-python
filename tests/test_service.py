@@ -416,3 +416,151 @@ def test_judge_baseline_and_compare_rules(tmp_path):
                if r["old_version"] is not None]
     by_rules = {r["rules_version"]: r["compatible"] for r in records}
     assert by_rules == {RULES_VERSION_2026_09: True, RULES_VERSION: False}
+
+
+# ---------------------------------------------------------------------------
+# 回归：对外兼容性检查链路的并发触发（bugfix-a）
+# ---------------------------------------------------------------------------
+
+def test_check_compatibility_concurrent_trigger_reuses_single_conclusion(
+    tmp_path, monkeypatch
+):
+    """同一对契约 + 同一规则版本被并发触发兼容性检查：
+
+    每个请求要么复用已完成的同一份结论，要么（judge 层面）明确收到
+    “正在进行中”；绝不因并发报内部错误、写坏彼此结果或留下半成品。
+    """
+    import itertools
+
+    fetches = itertools.chain([SPEC_V1], itertools.repeat(SPEC_V2_COMPAT))
+    monkeypatch.setattr(service_mod, "fetch_openapi",
+                        lambda url, timeout=5.0: next(fetches))
+    svc = ForgeService()
+    svc.generate("http://x", tmp_path)  # 归档 1.0.0 契约作为旧版本
+
+    computes = {"n": 0}
+    orig = ForgeService._compute_judgement
+
+    def counting(self2, *a, **k):
+        computes["n"] += 1
+        return orig(self2, *a, **k)
+
+    monkeypatch.setattr(ForgeService, "_compute_judgement", counting)
+
+    logger.info("业务场景: 对外兼容性检查链路并发触发; "
+                "用例: 10 并发 x 2 轮（首轮归档+落盘，次轮命中已完成结论）")
+
+    def fire_concurrent(rounds_label):
+        barrier = threading.Barrier(10)
+        outcomes: list = []
+
+        def worker():
+            barrier.wait(timeout=5)
+            try:
+                outcomes.append(("ok", svc.check_compatibility("http://x", tmp_path)))
+            except Exception as exc:  # noqa: BLE001
+                outcomes.append(("err", exc))
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        errors = [e for tag, e in outcomes if tag == "err"]
+        oks = [r for tag, r in outcomes if tag == "ok"]
+        logger.info("%s: 成功 %d / 失败 %d%s", rounds_label, len(oks), len(errors),
+                    f"（首个错误: {errors[0]!r}）" if errors else "")
+        assert len(outcomes) == 10
+        assert errors == [], f"并发触发不得出现内部错误: {errors!r}"
+        return oks
+
+    # 第一轮：判定归档与镜像落盘在并发下建立
+    first = fire_concurrent("第一轮(冷启动)")
+    assert computes["n"] == 1, "同一组合只允许计算一次"
+    baseline = first[0].to_dict()
+    assert all(r.to_dict() == baseline for r in first), "并发结果不得互相串"
+
+    # 第二轮：命中已完成的结论与已存在的镜像目录（历史上在此竞态写坏）
+    second = fire_concurrent("第二轮(复用)")
+    assert computes["n"] == 1, "重复触发不得重复计算"
+    assert all(r.to_dict() == baseline for r in second), "复用的结论必须与首轮一致"
+
+    # 无半成品：不存在临时目录 / 备份目录残留
+    leftovers = [str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")
+                 if p.name.startswith(".") or p.name.endswith(".old")]
+    assert leftovers == [], f"并发后不得留下半成品: {leftovers}"
+
+    # 归档与镜像都是完整成品，且内容一致
+    records = svc.list_judgements(tmp_path)
+    assert len(records) == 1
+    assert records[0]["old_version"] == "1.0.0"
+    assert records[0]["new_version"] == "2.0.0"
+    mirror = tmp_path / "2.0.0" / "checks" / RULES_VERSION / "compatibility.json"
+    assert mirror.exists()
+    mirrored = json.loads(mirror.read_text())
+    assert mirrored == baseline
+    logger.info("并发链路最终结论: compatible=%s, 归档记录=%s",
+                mirrored["compatible"], records)
+
+
+def test_check_compatibility_unknown_rules_version_no_residue(
+    tmp_path, monkeypatch
+):
+    """对外检查链路传入不存在的规则版本：可区分错误，且不产生任何残留。"""
+    logger.info("业务场景: 兼容性检查传入未知规则版本; "
+                "用例: 明确报错 + 不访问网络 + 不留残留")
+    def boom(url, timeout=5.0):
+        raise AssertionError("校验失败应先于网络访问")
+    monkeypatch.setattr(service_mod, "fetch_openapi", boom)
+    svc = ForgeService()
+    with pytest.raises(UnknownRulesVersionError) as exc:
+        svc.check_compatibility("http://x", tmp_path,
+                                rules_version="1999.01.01")
+    assert exc.value.rules_version == "1999.01.01"
+    assert RULES_VERSION in exc.value.available
+    # 没有任何残留产物（判定归档 / 版本目录 / 临时目录都不存在）
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_nested_required_evolution_archived_under_old_rules_replays_identically(
+    tmp_path,
+):
+    """嵌套新增必填字段：旧规则版本归档为兼容，任意时刻重跑/查回都原样重现。"""
+    from tests.test_versioning import _nested_required_evolution
+
+    old, new = _nested_required_evolution()
+    svc = ForgeService()
+    logger.info("业务场景: 嵌套必填新增按旧规则归档后复现; "
+                "用例: 归档 -> 重触发 -> 查询 -> replay 四处结论逐字节一致")
+
+    archived = svc.judge(old_contract=old, new_contract=new,
+                         output_dir=tmp_path,
+                         rules_version=RULES_VERSION_2026_09)
+    assert archived.compatible is True
+    assert archived.breaking_changes == []
+
+    # 重复触发复用归档；按版本查回；replay 纯计算复现 —— 四份结论逐字节一致
+    retriggered = svc.judge(old_contract=old, new_contract=new,
+                            output_dir=tmp_path,
+                            rules_version=RULES_VERSION_2026_09)
+    fetched = svc.get_judgement(
+        output_dir=tmp_path, old_version="1.0.0", new_version="2.0.0",
+        rules_version=RULES_VERSION_2026_09,
+    )
+    replayed = svc.replay(old_contract=old, new_contract=new,
+                          rules_version=RULES_VERSION_2026_09)
+    assert (archived.to_dict() == retriggered.to_dict()
+            == fetched.to_dict() == replayed.to_dict())
+
+    # 同一演进在当前规则下归档为破坏：新规则更严，但不动旧版本历史语义
+    current = svc.judge(old_contract=old, new_contract=new,
+                        output_dir=tmp_path, rules_version=RULES_VERSION)
+    assert current.compatible is False
+    assert any(c.kind == "required_added"
+               and c.location.endswith("请求体.item.extra2")
+               for c in current.breaking_changes)
+
+    by_rules = {r["rules_version"]: r["compatible"]
+                for r in svc.list_judgements(tmp_path)}
+    assert by_rules == {RULES_VERSION_2026_09: True, RULES_VERSION: False}
+    logger.info("归档复现结论: %s", by_rules)

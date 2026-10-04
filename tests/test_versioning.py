@@ -454,3 +454,117 @@ def test_replay_independent_of_execution_order():
     compare_across_rules(old_ir, new_ir)
     again = check_with_rules(old_ir, new_ir, RULES_VERSION)
     assert first.to_dict() == again.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# 回归：嵌套对象新增必填字段在冻结旧规则下的复现（bugfix-a）
+# ---------------------------------------------------------------------------
+
+def _nested_required_evolution():
+    """请求体嵌套对象 Item 新增必填字段 extra2 的同一对契约。"""
+    def spec(version, item_required, with_extra2=False):
+        item_props = {"sku": {"type": "string"}, "extra": {"type": "string"}}
+        if with_extra2:
+            item_props["extra2"] = {"type": "string"}
+        return {
+            "openapi": "3.1.0",
+            "info": {"title": "Demo", "version": version},
+            "paths": {"/orders": {"post": {
+                "operationId": "create_order", "tags": ["orders"],
+                "requestBody": {"required": True, "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/Order"}}}},
+                "responses": {"201": {"description": "created"}}}}},
+            "components": {"schemas": {
+                "Order": {"type": "object", "required": ["item"],
+                          "properties": {
+                              "item": {"$ref": "#/components/schemas/Item"},
+                              "note": {"type": "string"}}},
+                "Item": {"type": "object", "required": item_required,
+                         "properties": item_props},
+            }},
+        }
+    old = spec("1.0.0", ["sku"])
+    new = spec("2.0.0", ["sku", "extra2"], with_extra2=True)
+    return old, new
+
+
+def test_nested_required_field_replay_matches_frozen_2026_09():
+    """嵌套新增必填字段：旧规则版本归档结论是兼容，重跑必须原样重现。
+
+    2026.09.01 发布时，请求方向「新增必填字段判破坏」只覆盖请求体顶层，
+    嵌套对象的必填新增按放宽接受；该语义随规则版本冻结，重跑不得变成破坏。
+    """
+    old, new = _nested_required_evolution()
+    old_ir, new_ir = parse_contract(old), parse_contract(new)
+    logger.info("业务场景: 请求体嵌套对象新增必填字段; 用例: 旧规则复现 + 新旧规则对比")
+    logger.info("旧契约:\n%s\n新契约:\n%s",
+                json.dumps(old, ensure_ascii=False),
+                json.dumps(new, ensure_ascii=False))
+
+    frozen = check_with_rules(old_ir, new_ir, RULES_VERSION_2026_09)
+    logger.info("2026.09.01 复现结论: compatible=%s accepted=%s breaking=%s",
+                frozen.compatible,
+                [a.format() for a in frozen.accepted_changes],
+                [c.format() for c in frozen.breaking_changes])
+    assert frozen.compatible is True, "旧规则归档结论是兼容，复现不得变成破坏"
+    assert frozen.breaking_changes == []
+    assert any(
+        a.location.endswith("请求体.item.extra2") and a.direction == "request"
+        for a in frozen.accepted_changes
+    ), "嵌套必填新增在旧规则下应登记为接受项，定位到嵌套字段"
+
+    # 同一规则版本任意时刻重跑：结论/定位/类别/依据逐字节一致
+    frozen_again = check_with_rules(old_ir, new_ir, RULES_VERSION_2026_09)
+    assert frozen.to_dict() == frozen_again.to_dict()
+    assert frozen.checked_at == ""
+
+    # 当前规则更严：同一演进判破坏，定位/方向/类别精确到嵌套字段
+    current = check_with_rules(old_ir, new_ir, RULES_VERSION)
+    logger.info("2026.10.01 结论: compatible=%s breaking=%s",
+                current.compatible,
+                [c.format() for c in current.breaking_changes])
+    assert current.compatible is False
+    change = next(c for c in current.breaking_changes
+                  if c.kind == "required_added")
+    assert change.direction == "request"
+    assert change.location.endswith("请求体.item.extra2")
+
+    # 跨规则版本对比一次跑出各版本各自结论
+    compared = compare_across_rules(old_ir, new_ir)
+    assert compared[RULES_VERSION_2026_09].to_dict() == frozen.to_dict()
+    assert compared[RULES_VERSION].to_dict() == current.to_dict()
+
+
+def test_top_level_required_field_still_breaking_under_all_rules():
+    """对照用例：请求体顶层新增必填字段，新旧规则都必须判破坏（不得过度放宽）。"""
+    def spec(version, top_required, with_coupon=False):
+        props = {"item": {"type": "object",
+                          "properties": {"sku": {"type": "string"}},
+                          "required": ["sku"]},
+                 "note": {"type": "string"}}
+        if with_coupon:
+            props["coupon"] = {"type": "string"}
+        return {
+            "openapi": "3.1.0", "info": {"title": "Demo", "version": version},
+            "paths": {"/orders": {"post": {
+                "operationId": "create_order", "tags": ["orders"],
+                "requestBody": {"required": True, "content": {
+                    "application/json": {"schema": {
+                        "type": "object", "required": top_required,
+                        "properties": props}}}},
+                "responses": {"201": {"description": "created"}}}}},
+        }
+    old = spec("1.0.0", ["item"])
+    new = spec("2.0.0", ["item", "coupon"], with_coupon=True)
+    old_ir, new_ir = parse_contract(old), parse_contract(new)
+    logger.info("业务场景: 请求体顶层新增必填字段; 用例: 两个规则版本都必须判破坏")
+    for version in (RULES_VERSION_2026_09, RULES_VERSION):
+        report = check_with_rules(old_ir, new_ir, version)
+        logger.info("规则 %s 结论: compatible=%s breaking=%s", version,
+                    report.compatible,
+                    [c.format() for c in report.breaking_changes])
+        assert report.compatible is False
+        assert any(c.kind == "required_added"
+                   and c.location.endswith("请求体.coupon")
+                   for c in report.breaking_changes)

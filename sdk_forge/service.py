@@ -11,6 +11,9 @@
   落盘仍是原子切换，过程中不会留下半成品，并发请求之间不会串结果。
 * **原子落盘**：先写入同级临时目录并 fsync，再 ``os.replace`` 原子切换；
   任何失败都清理半成品，磁盘上只可能出现"上一版完整产物"或"本次完整产物"。
+  同一目标路径的并发原子写按路径互斥（见 :meth:`ForgeService._atomic_write`）：
+  并发兼容性检查写同一镜像目录只会有一个在写，不会竞态写坏或留下半成品；
+  镜像内容未变时跳过写入，不覆盖已完成结论。
 * **版本匹配**：调用方声明 ``expected_version`` 时与运行时版本严格比对，
   不一致抛 :class:`VersionMismatchError`。
 """
@@ -115,6 +118,39 @@ class ForgeService:
         self._guard = threading.Lock()
         # 判定去重：judge_key -> 进行中条目的同步原语与结果
         self._judging: dict[str, dict] = {}
+        # 落盘串行化：目标路径 -> 写锁。原子写单个目录是安全的，但两个线程
+        # 并发原子写同一目标（如并发兼容性检查写同一镜像目录）会在
+        # replace/backup 序列上竞态，必须按目标路径互斥。
+        self._write_locks: dict[str, threading.Lock] = {}
+
+    def _lock_for(self, target: Path) -> threading.Lock:
+        key = str(target)
+        with self._guard:
+            lock = self._write_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._write_locks[key] = lock
+            return lock
+
+    def _atomic_write(self, target: Path, files: dict[str, bytes | str]) -> None:
+        """同一目标路径的并发原子写互斥（不同目标之间不互相阻塞）。"""
+        with self._lock_for(target):
+            _atomic_write_tree(target, files)
+
+    def _mirror_file_if_changed(
+        self, target: Path, rel: str, content: str
+    ) -> None:
+        """单文件幂等镜像：现有内容一致则跳过，否则原子写。
+
+        读取现有内容与写入都在同一目标路径锁内，并发调用不会读到
+        替换窗口中的半成品，也不会对已完成结论做覆盖性写入。
+        """
+        with self._lock_for(target):
+            existing = target / rel
+            if (existing.exists()
+                    and existing.read_text(encoding="utf-8") == content):
+                return
+            _atomic_write_tree(target, {rel: content})
 
     def _acquire(self, slot: str) -> threading.Lock | None:
         """尝试占用某槽位；已被占用时返回 None。"""
@@ -213,7 +249,7 @@ class ForgeService:
                 files[rel] = content
             files["sdk.zip"] = render_sdk_zip(files_text)
 
-            _atomic_write_tree(output_dir / version_key, files)
+            self._atomic_write(output_dir / version_key, files)
             return {
                 "status": "generated",
                 "version": ir.version,
@@ -411,7 +447,7 @@ class ForgeService:
             files[_JUDGE_OLD_FILE] = json.dumps(
                 old_contract, ensure_ascii=False, indent=2, sort_keys=True
             )
-        _atomic_write_tree(target_dir, files)
+        self._atomic_write(target_dir, files)
         return report
 
     def check_compatibility(
@@ -424,6 +460,10 @@ class ForgeService:
         rules_version: str = RULES_VERSION,
     ) -> CompatibilityReport:
         output_dir = Path(output_dir)
+        # 先校验规则版本：未注册的版本直接报可区分错误，
+        # 不访问网络、不触碰磁盘、绝不静默按当前规则处理
+        if rules_version not in available_rules_versions():
+            raise UnknownRulesVersionError(rules_version, available_rules_versions())
         spec = fetch_openapi(base_url, timeout=timeout)
         new_ir = parse_contract(spec)
         version_key = new_ir.version or "_unversioned"
@@ -440,13 +480,13 @@ class ForgeService:
             wait=True,
         )
 
-        # 兼容旧布局：按版本目录再镜像一份报告（整体原子写，永不覆盖为半成品）
+        # 兼容旧布局：按版本目录再镜像一份报告。内容未变时跳过，
+        # 避免对已完成结论做任何覆盖性写入；读写经目标路径锁串行化，
+        # 并发检查不会互相写坏、不会留下半成品。
         report_dir = output_dir / version_key / "checks" / rules_version
-        _atomic_write_tree(
-            report_dir,
-            {_REPORT_FILE: json.dumps(report.to_dict(), ensure_ascii=False,
-                                      indent=2, sort_keys=True)},
-        )
+        payload = json.dumps(report.to_dict(), ensure_ascii=False,
+                             indent=2, sort_keys=True)
+        self._mirror_file_if_changed(report_dir, _REPORT_FILE, payload)
 
         if raise_on_breaking and not report.compatible:
             raise IncompatibleContractError(
