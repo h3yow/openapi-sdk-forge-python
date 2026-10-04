@@ -61,6 +61,10 @@ OpenAPI **3.x**（FastAPI 默认产出 3.1.0），具体支持：
 | 类型收窄（如 `number → integer`、可空→非空、format 收窄）、枚举收窄 | 拒绝（`type_narrowed` / `enum_narrowed`） |
 | 新增**可选**参数/字段、必填→可选、类型放宽、枚举新增取值 | 接受 |
 
+> 嵌套对象（请求体字段的对象、数组元素对象等第二层及更深）的字段级校验自规则
+> `2026.10.01` 起纳入；在 `2026.09.01` 下只校验请求体第一层字段，嵌套对象内部的
+> 新增必填字段等变化不判破坏（冻结的历史语义，见「规则集版本」）。
+
 ### 响应方向（`response`，新服务向旧客户端回数据）
 
 | 变化 | 结论 |
@@ -84,8 +88,15 @@ OpenAPI **3.x**（FastAPI 默认产出 3.1.0），具体支持：
 
 | 规则版本 | 与上一版的实际差异 |
 | --- | --- |
-| `2026.09.01`（冻结） | 响应字段「必填→可选」当时按放宽接受 |
-| `2026.10.01`（当前，`RULES_VERSION`） | 同样的变化改判为破坏（`required_removed`）；请求/响应方向分离 |
+| `2026.09.01`（冻结） | 响应字段「必填→可选」当时按放宽接受；请求方向只校验请求体**第一层**字段，不深入嵌套对象 |
+| `2026.10.01`（当前，`RULES_VERSION`） | 同样的变化改判为破坏（`required_removed`）；请求/响应方向分离；请求方向新增**嵌套对象字段级校验**（如嵌套对象新增必填字段判 `required_added`） |
+
+「冻结」的含义：某个规则版本一经发布，它对任意一份契约演进的判定语义就不再变化。
+新规则要更严时，新增版本号并在 `_RULESETS` 注册新的 `_RuleSet`
+（差异通过构造参数显式表达，如 `response_required_relaxed`、
+`request_nested_object_checks`），**旧版本参数原样保留**。因此同一份契约演进、
+同一个已发布的规则版本，无论什么时候重跑，结论、定位、类别和依据都与当初
+归档的完全一致；新规则可以比旧规则更严，但不会改变旧版本的历史语义。
 
 - **复现**：`check_with_rules(old, new, "2026.09.01")` 用旧规则重跑，
   `check_with_rules(old, new, "2026.10.01")` 用新规则重跑。复现不盖时间戳，
@@ -153,12 +164,19 @@ artifacts/
 ```
 
 写入采用「临时目录 + fsync + `os.replace` 原子切换」：任何失败都会清理临时目录，
-磁盘上只可能存在上一版完整产物或本次完整产物，不会出现半成品。
+磁盘上只可能存在上一版完整产物或本次完整产物，不会出现半成品。同一目标目录的
+并发写入按目录锁串行，两个写序列不会交错，并发触发不会因此产生内部错误。
 
 **判定幂等与并发**：判定按「旧契约版本 + 新契约版本 + 规则版本」唯一归档。
-重复触发直接返回已完成报告（不重复计算、不覆盖）；并发触发同一组合时，默认得到
-`409 judgement_in_progress`，传 `wait=true` 则等待并复用正在进行的同一份结论
-（worker 失败时等待方收到同一失败，且不留下半成品）。
+重复触发直接返回已完成报告（不重复计算、不覆盖）；并发触发同一组合时，每个请求
+只会得到两种结果之一——
+
+- `409 judgement_in_progress`（明确告知「正在进行中」，`/forge/judge` 默认行为）；或
+- 等待并复用正在进行的同一份结论（`/forge/judge` 传 `wait=true`；
+  `/forge/check-compatibility` 内部总是走这条路）。
+
+worker 失败时等待方收到同一失败，且不留下半成品；任何情况下并发请求之间不会
+互相写坏、不会串结果，已完成结论不会被重复计算或覆盖。
 
 ## 本地验证方法
 
@@ -166,10 +184,13 @@ artifacts/
 # 1. 安装依赖（需要 Python 3.14）
 uv sync --group dev
 
-# 2. 运行全部测试（-s 会打印契约输入与判定依据日志）
+# 2. 运行全部测试（-s 会打印契约输入与判定依据日志；
+#    日志开头列出各业务（测试文件）覆盖的用例，每个用例结束打印通过情况）
 uv run pytest
 #    重点：tests/test_versioning.py（方向语义、规则冻结/复现/对比）
 #          tests/test_service.py（判定幂等、并发去重、归档查询）
+#          tests/test_concurrency.py（并发触发兼容性检查链路）
+#          tests/test_rules_freeze.py（旧规则版本回溯复现、跨版本对比）
 
 # 3. 启动演示服务
 uv run uvicorn main:app --reload
@@ -242,6 +263,23 @@ same   = svc.get_judgement(output_dir="artifacts", old_version="1.0.0",
                            new_version="2.0.0", rules_version=RULES_VERSION)
 rows   = svc.list_judgements("artifacts")
 across = compare_across_rules(parse_contract(old), parse_contract(new))
+```
+
+### 本地验证：并发行为与规则回溯
+
+```bash
+# 并发触发同一对契约 + 同一规则版本的判定（只会看到 200 复用结论或 409 进行中）
+for i in $(seq 10); do
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/forge/judge \
+    -H 'Content-Type: application/json' \
+    -d '{"old_contract": {...}, "new_contract": {...}, "rules_version": "2026.10.01"}' &
+done; wait
+# 并发结束后重复触发：直接复用归档结论，不重复计算
+curl -s http://localhost:8000/forge/judgements   # 同一组合只有一条归档记录
+
+# 规则回溯：用旧规则版本复现归档结论，并与当前规则版本对比
+uv run pytest tests/test_concurrency.py   # 并发链路：进行中或复用，无 5xx、无半成品
+uv run pytest tests/test_rules_freeze.py  # 旧规则原样重现归档结论 + 跨版本对比
 ```
 
 ## 代码结构

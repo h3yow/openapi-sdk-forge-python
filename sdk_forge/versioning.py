@@ -10,6 +10,9 @@
 
 * 新增必填参数/请求体字段、删除参数/字段、可选 -> 必填、类型收窄、枚举收窄：拒绝
 * 新增可选参数/字段、必填 -> 可选、类型放宽、枚举新增取值：接受
+* 嵌套对象（请求体字段的对象、数组元素对象等第二层及更深）的字段级校验
+  自 2026.10.01 起才纳入（``request_nested_object_checks``）；2026.09.01 只校验
+  请求体第一层字段，嵌套对象内部的新增必填字段等变化当时不判破坏
 
 响应方向（服务端 -> 客户端，2026.10.01 起与请求方向分离）：
 
@@ -135,11 +138,31 @@ class _RuleSet:
 
     :param response_required_relaxed: 响应方向「必填 -> 可选」是否按放宽接受。
         2026.09.01 为 True（历史行为），2026.10.01 起为 False（判为破坏）。
+    :param request_nested_object_checks: 请求方向是否深入校验嵌套对象
+        （请求体第二层及更深的对象字段）。2026.09.01 为 False（只校验请求体
+        第一层字段，嵌套对象内部变化当时不判破坏），2026.10.01 起为 True。
     """
 
-    def __init__(self, version: str, *, response_required_relaxed: bool) -> None:
+    def __init__(
+        self,
+        version: str,
+        *,
+        response_required_relaxed: bool,
+        request_nested_object_checks: bool,
+    ) -> None:
         self.version = version
         self.response_required_relaxed = response_required_relaxed
+        self.request_nested_object_checks = request_nested_object_checks
+
+    def _checks_object_fields(self, direction: str, depth: int) -> bool:
+        """是否在给定层级深入比较对象字段（冻结语义的一部分）。
+
+        响应方向各版本始终全层级校验；请求方向在 2026.09.01 下只校验
+        第一层（depth == 0），2026.10.01 起全层级校验。
+        """
+        if direction != DIRECTION_REQUEST:
+            return True
+        return depth == 0 or self.request_nested_object_checks
 
     # -- schema 级 -----------------------------------------------------------
 
@@ -152,16 +175,19 @@ class _RuleSet:
         location: str,
         accepted: list[AcceptedChange],
         direction: str,
+        depth: int = 0,
     ) -> list[BreakingChange]:
         """比较两处 schema，返回破坏性变更。
 
         :param direction: ``DIRECTION_REQUEST`` / ``DIRECTION_RESPONSE``，
             必填性语义随方向变化；删字段、类型/枚举收窄两个方向一致拒绝。
+        :param depth: 嵌套层级（请求体/响应体本身为 0）；请求方向的嵌套
+            对象字段校验是否深入由规则版本决定（见 :meth:`_checks_object_fields`）。
         """
         o = _normalize(old_raw, spec_old)
         n = _normalize(new_raw, spec_new)
         return self._diff_normalized(
-            o, n, spec_old, spec_new, location, accepted, direction
+            o, n, spec_old, spec_new, location, accepted, direction, depth
         )
 
     def _diff_normalized(
@@ -173,6 +199,7 @@ class _RuleSet:
         location: str,
         accepted: list[AcceptedChange],
         direction: str,
+        depth: int,
     ) -> list[BreakingChange]:
         changes: list[BreakingChange] = []
 
@@ -259,13 +286,15 @@ class _RuleSet:
                 _acc(accepted, location, "enum_widened",
                      f"枚举新增取值 {added}", direction)
 
-        # 对象字段（必填性语义随方向变化）
+        # 对象字段（必填性语义随方向变化；请求方向嵌套层级是否深入由规则版本决定）
         if nt == "object" and ("properties" in o or "properties" in n):
-            changes.extend(
-                self._diff_object(
-                    o, n, spec_old, spec_new, location, accepted, direction
+            if self._checks_object_fields(direction, depth):
+                changes.extend(
+                    self._diff_object(
+                        o, n, spec_old, spec_new, location, accepted,
+                        direction, depth,
+                    )
                 )
-            )
 
         # 数组元素
         if nt == "array":
@@ -274,7 +303,7 @@ class _RuleSet:
                 changes.extend(
                     self.diff_schemas(
                         oi, ni, spec_old, spec_new,
-                        f"{location}[]", accepted, direction,
+                        f"{location}[]", accepted, direction, depth + 1,
                     )
                 )
 
@@ -287,7 +316,7 @@ class _RuleSet:
                 changes.extend(
                     self.diff_schemas(
                         old_ap, n["additionalProperties"], spec_old, spec_new,
-                        f"{location}.<value>", accepted, direction,
+                        f"{location}.<value>", accepted, direction, depth + 1,
                     )
                 )
 
@@ -340,6 +369,7 @@ class _RuleSet:
         location: str,
         accepted: list[AcceptedChange],
         direction: str,
+        depth: int,
     ) -> list[BreakingChange]:
         changes: list[BreakingChange] = []
         old_props = o.get("properties", {})
@@ -388,7 +418,7 @@ class _RuleSet:
             changes.extend(
                 self.diff_schemas(
                     old_props[fname], new_props[fname],
-                    spec_old, spec_new, floc, accepted, direction,
+                    spec_old, spec_new, floc, accepted, direction, depth + 1,
                 )
             )
 
@@ -577,12 +607,17 @@ class _RuleSet:
 
 
 # 规则注册表：复现历史判定时按版本取用；条目一经发布即冻结，不得就地修改。
+# 新规则要更严时，新增版本号并显式给出该版本的完整参数，旧版本参数保持不变。
 _RULESETS: dict[str, _RuleSet] = {
     RULES_VERSION_2026_09: _RuleSet(
-        RULES_VERSION_2026_09, response_required_relaxed=True
+        RULES_VERSION_2026_09,
+        response_required_relaxed=True,
+        request_nested_object_checks=False,
     ),
     RULES_VERSION: _RuleSet(
-        RULES_VERSION, response_required_relaxed=False
+        RULES_VERSION,
+        response_required_relaxed=False,
+        request_nested_object_checks=True,
     ),
 }
 

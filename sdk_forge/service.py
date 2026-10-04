@@ -11,6 +11,7 @@
   落盘仍是原子切换，过程中不会留下半成品，并发请求之间不会串结果。
 * **原子落盘**：先写入同级临时目录并 fsync，再 ``os.replace`` 原子切换；
   任何失败都清理半成品，磁盘上只可能出现"上一版完整产物"或"本次完整产物"。
+  同一目标目录的并发写入按目录锁串行，杜绝两个替换序列交错导致的内部错误。
 * **版本匹配**：调用方声明 ``expected_version`` 时与运行时版本严格比对，
   不一致抛 :class:`VersionMismatchError`。
 """
@@ -61,11 +62,35 @@ _JUDGE_NEW_FILE = "new_contract.json"
 _BASELINE_KEY = "__baseline__"
 
 
+# 目录级写锁注册表：同一目标目录的原子切换必须串行。
+# 否则两个线程并发执行 target <-> .old 的替换序列时会互相踩掉
+# （FileNotFoundError / OSError），对外表现为并发触发时的 500。
+_WRITE_LOCKS_GUARD = threading.Lock()
+_WRITE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _write_lock_for(target: Path) -> threading.Lock:
+    key = os.path.normpath(str(target))
+    with _WRITE_LOCKS_GUARD:
+        lock = _WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _WRITE_LOCKS[key] = lock
+        return lock
+
+
 def _atomic_write_tree(target: Path, files: dict[str, bytes | str]) -> None:
     """把文件集合原子地写入 target 目录。
 
     target 已存在时整体替换；写入过程中 target 保持旧内容不变。
+    同一 target 的并发调用按目录锁串行：后到者整体覆盖先到者的完整结果，
+    任何时刻磁盘上都不会出现两个写序列交错出的半成品。
     """
+    with _write_lock_for(target):
+        _atomic_write_tree_locked(target, files)
+
+
+def _atomic_write_tree_locked(target: Path, files: dict[str, bytes | str]) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
     try:
@@ -440,13 +465,17 @@ class ForgeService:
             wait=True,
         )
 
-        # 兼容旧布局：按版本目录再镜像一份报告（整体原子写，永不覆盖为半成品）
+        # 兼容旧布局：按版本目录再镜像一份报告（整体原子写，永不覆盖为半成品）。
+        # 内容相同（重复触发/并发复用同一结论）时跳过，不回写已完成结论。
         report_dir = output_dir / version_key / "checks" / rules_version
-        _atomic_write_tree(
-            report_dir,
-            {_REPORT_FILE: json.dumps(report.to_dict(), ensure_ascii=False,
-                                      indent=2, sort_keys=True)},
-        )
+        report_json = json.dumps(report.to_dict(), ensure_ascii=False,
+                                 indent=2, sort_keys=True)
+        report_file = report_dir / _REPORT_FILE
+        if not (
+            report_file.exists()
+            and report_file.read_text(encoding="utf-8") == report_json
+        ):
+            _atomic_write_tree(report_dir, {_REPORT_FILE: report_json})
 
         if raise_on_breaking and not report.compatible:
             raise IncompatibleContractError(
